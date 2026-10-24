@@ -1,0 +1,11 @@
+/target/
+# The binaries that `make build`, `make evalspeed` and `make tablebases` copy here
+/varifish
+/varifish.exe
+/varifish.wasm
+/evalspeed
+/evalspeed.exe
+/tablebases
+/tablebases.exe
+# The browser build, from web/build.sh
+/web/dist/

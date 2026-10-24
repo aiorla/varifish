@@ -1,0 +1,28 @@
+# Checks and tests varifish on Linux, macOS and Windows, with the toolchain
+# that rust-toolchain.toml pins and the default network that `make net`
+# downloads.
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: The pinned toolchain
+        run: |
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" \
+            --profile minimal --component clippy,rustfmt
+      - name: make, where Windows lacks it
+        if: runner.os == 'Windows'
+        run: command -v make || choco install make --no-progress -y
+      - run: make net
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked

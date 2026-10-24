@@ -1,0 +1,93 @@
+# For a version's tag (v0.1.0, say), builds varifish for Linux, Windows and
+# macOS, for each ARCH of Stockfish's releases that its Makefile takes, with
+# the default network embedded, and attaches the archives to a draft
+# release, to be checked and published by hand. Atomic's network is not
+# included: Atomic-Stockfish's v1.0 release has it. The Linux builds for
+# x86-64-avx2 and x86-64-bmi2 are laid out by BOLT, as `make bolt` does.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+env:
+  GH_TOKEN: ${{ github.token }}
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: The tag names Cargo.toml's version
+        run: test "$GITHUB_REF_NAME" = "v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+      - run: gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "varifish $GITHUB_REF_NAME" --notes ""
+  build:
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        # The Linux binaries need glibc 2.34 or later, whichever Ubuntu
+        # builds them. A build's bench runs where the runner surely has its
+        # instructions.
+        include:
+          - { os: ubuntu-24.04, platform: linux, arch: x86-64, bench: true }
+          - { os: ubuntu-24.04, platform: linux, arch: x86-64-sse41-popcnt, bench: true }
+          - { os: ubuntu-24.04, platform: linux, arch: x86-64-avx2, bench: true, bolt: true }
+          - { os: ubuntu-24.04, platform: linux, arch: x86-64-bmi2, bench: true, bolt: true }
+          - { os: ubuntu-24.04, platform: linux, arch: x86-64-avx512 }
+          - { os: ubuntu-24.04, platform: linux, arch: x86-64-vnni512 }
+          - { os: ubuntu-24.04, platform: linux, arch: x86-64-avx512icl }
+          - { os: ubuntu-24.04-arm, platform: linux, arch: armv8, bench: true }
+          - { os: ubuntu-24.04-arm, platform: linux, arch: armv8-dotprod, bench: true }
+          - { os: windows-latest, platform: windows, arch: x86-64, bench: true }
+          - { os: windows-latest, platform: windows, arch: x86-64-sse41-popcnt, bench: true }
+          - { os: windows-latest, platform: windows, arch: x86-64-avx2, bench: true }
+          - { os: windows-latest, platform: windows, arch: x86-64-bmi2, bench: true }
+          - { os: windows-latest, platform: windows, arch: x86-64-avx512 }
+          - { os: windows-latest, platform: windows, arch: x86-64-vnni512 }
+          - { os: windows-latest, platform: windows, arch: x86-64-avx512icl }
+          - { os: macos-latest, platform: macos, arch: apple-silicon, bench: true }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: The pinned toolchain
+        run: |
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" \
+            --profile minimal
+      - name: make, where Windows lacks it
+        if: runner.os == 'Windows'
+        run: command -v make || choco install make --no-progress -y
+      - name: LLVM's BOLT, where the build is laid out by it
+        if: matrix.bolt
+        run: sudo apt-get update && sudo apt-get install -y bolt-20
+      - run: make ${{ matrix.bolt && 'bolt' || 'build' }} ARCH=${{ matrix.arch }}
+      - name: The binary's name
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then exe=varifish.exe; else exe=varifish; fi
+          echo "exe=$exe" >> "$GITHUB_ENV"
+      - name: Its bench, the same on every platform
+        if: matrix.bench
+        run: |
+          ./"$exe" bench 2>&1 | tee bench.txt
+          grep -q "^Nodes searched  : 1559611$" bench.txt
+      - name: Atomic's bench too, where BOLT moved the code
+        if: matrix.bolt
+        run: |
+          printf 'setoption name UCI_Variant value atomic\nsetoption name EvalFile value %s\nbench\nquit\n' \
+            nets/atomic_run3b_e202_l05.nnue | ./"$exe" 2>&1 | tee atomic.txt
+          grep -q "^Nodes searched  : 292002$" atomic.txt
+      - name: The archive, with the license, the authors and the guide
+        run: |
+          name=varifish-$GITHUB_REF_NAME-${{ matrix.platform }}-${{ matrix.arch }}
+          mkdir "$name"
+          cp "$exe" LICENSE AUTHORS README.md "$name"/
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a "$name.zip" "$name"
+            echo "archive=$name.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "$name.tar.gz" "$name"
+            echo "archive=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - run: gh release upload "$GITHUB_REF_NAME" "$archive"

@@ -1,0 +1,40 @@
+[package]
+name = "varifish"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+description = "A UCI engine for chess and its variants, translated from Stockfish"
+license = "GPL-3.0-or-later"
+
+# The Stockfish commit whose chess varifish reproduces exactly, and the
+# Atomic-Stockfish commit whose Atomic rules, evaluation and tablebase probes
+# it reproduces.
+[package.metadata.upstream]
+stockfish = "effdc3fd3f6de6e75fe1374a51a7a7eed66f880b"
+atomic-stockfish = "8e81598f0dc8133fc3ee24ba6128327af58f4534"
+
+[dependencies]
+
+[features]
+# Search constants as UCI options, for SPSA: see src/tune.rs.
+tune = []
+
+# shakmaty and shakmaty-syzygy are only oracles for the tests and examples;
+# the engine has no dependencies.
+[dev-dependencies]
+shakmaty = { version = "0.30.1", features = ["variant"] }
+shakmaty-syzygy = { version = "0.28.1", features = ["variant"] }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+
+# Tests run perft trees in the dev profile, with debug assertions: light
+# optimization keeps them at seconds, and the oracle runs at full speed.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

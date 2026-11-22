@@ -236,6 +236,7 @@ fn check_position(pos: &mut Position, sk: &SkAtomic, chess960: bool, seen: &mut 
         "{fen}"
     );
     assert_eq!(st.check_squares, new.check_squares, "{fen}");
+    assert_eq!(st.piece_placement, new.piece_placement, "{fen}");
     let threats_by = |pos: &Position| {
         [ALL_PIECES, PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING].map(|pt| pos.threats_by(pt))
     };
@@ -348,6 +349,11 @@ fn check_position(pos: &mut Position, sk: &SkAtomic, chess960: bool, seen: &mut 
         pos.do_null_move();
         let fresh = Position::from_fen(&pos.fen(), chess960).unwrap();
         assert_eq!(pos.state().key, fresh.state().key, "{fen}");
+        assert_eq!(
+            pos.state().piece_placement,
+            fresh.state().piece_placement,
+            "{fen}"
+        );
         pos.undo_null_move();
         assert_eq!((pos.fen(), pos.state().clone()), (fen.clone(), state));
     }
@@ -684,4 +690,38 @@ fn static_exchange_evaluation() {
     assert_eq!(see("6rk/8/8/8/8/8/8/K5R1 w - - 0 1", "g1g8"), VALUE_MATE);
     // A quiet move next to the enemy king cannot be taken.
     assert_eq!(see("7k/8/8/8/8/8/8/K5R1 w - - 0 1", "g1g7"), 0);
+}
+
+#[test]
+fn blast_values() {
+    let value = |fen: &str, m: &str| {
+        let pos = Position::from_fen(fen, false).unwrap();
+        let m = varifish::uci::to_move(&pos, m);
+        assert_ne!(m, Move::none());
+        pos.atomic_blast_value(m)
+    };
+
+    // A pawn for the bishop, and also a knight of ours or of theirs
+    let fen = "4k3/8/8/8/2p5/1B6/8/4K3 w - - 0 1";
+    assert_eq!(value(fen, "b3c4"), 301 - 738);
+    let fen = "4k3/8/8/8/2p5/1B1N4/8/4K3 w - - 0 1";
+    assert_eq!(value(fen, "b3c4"), 301 - 738 - 702);
+    let fen = "4k3/8/8/3n4/2p5/1B6/8/4K3 w - - 0 1";
+    assert_eq!(value(fen, "b3c4"), 301 - 738 + 702);
+
+    // Pawns next to the capture survive it.
+    let fen = "4k3/8/8/1P1p4/2p5/1B6/8/4K3 w - - 0 1";
+    assert_eq!(value(fen, "b3c4"), 301 - 738);
+
+    // A pawn for a pawn en passant, and a rook for a pawn that promotes
+    assert_eq!(value("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2", "e5d6"), 0);
+    assert_eq!(
+        value("r3k3/1P6/8/8/8/8/8/4K3 w - - 0 1", "b7a8q"),
+        1079 - 301
+    );
+
+    // The blast the static exchange evaluation counts, without its last
+    // point
+    let fen = "7k/8/8/2pBn3/3r4/2PQN3/8/K7 w - - 0 1";
+    assert_eq!(value(fen, "d3d4"), 1079 + 702 - 1862 - 702 - 738);
 }

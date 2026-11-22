@@ -6,6 +6,8 @@
 //! Glaurung 2.1, Copyright (C) 2004-2026 The Stockfish developers (see
 //! AUTHORS), under the GNU General Public License, version 3 or later.
 
+use crate::types::{SQUARE_NB, Square};
+
 /// Version of the evaluation file
 pub const VERSION: u32 = 0x6A44_8AFA;
 
@@ -16,6 +18,22 @@ pub const FT_MAX_VAL: i16 = 255;
 pub const HIDDEN_ONE_VAL: i32 = 128;
 
 pub const MAX_SIMD_WIDTH: usize = 32;
+
+/// Orient a square according to perspective: reflect kings on files a..d,
+/// so that they land on e..h
+pub const ORIENT_TBL: [u8; SQUARE_NB] = {
+    let mut table = [0; SQUARE_NB];
+    let mut s = 0;
+    while s < SQUARE_NB {
+        table[s] = if s % 8 < 4 {
+            Square::H1.0
+        } else {
+            Square::A1.0
+        };
+        s += 1;
+    }
+    table
+};
 
 /// Round n up to be a multiple of base
 pub const fn ceil_to_multiple(n: usize, base: usize) -> usize {
@@ -65,6 +83,11 @@ impl<'a> Reader<'a> {
         Some(bytes)
     }
 
+    pub fn read_u16(&mut self) -> u16 {
+        self.take(2)
+            .map_or(0, |b| u16::from_le_bytes(b.try_into().unwrap()))
+    }
+
     pub fn read_u32(&mut self) -> u32 {
         self.take(4)
             .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
@@ -94,6 +117,10 @@ impl<'a> Reader<'a> {
             }
         }
     }
+}
+
+pub fn write_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
 }
 
 pub fn write_u32(out: &mut Vec<u8>, value: u32) {

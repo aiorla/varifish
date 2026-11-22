@@ -50,6 +50,20 @@ impl<T> LargePageBox<T> {
         LargePageBox { ptr: ptr.cast() }
     }
 
+    /// `value` in its own allocation: for a value small enough to build on
+    /// the stack, which needs no large pages but lives as the large ones do.
+    pub fn new(value: T) -> LargePageBox<T> {
+        let layout = Self::layout();
+        // SAFETY: the layout's size is not zero.
+        let ptr = unsafe { alloc::alloc(layout) }.cast::<T>();
+        let Some(ptr) = NonNull::new(ptr) else {
+            alloc::handle_alloc_error(layout);
+        };
+        // SAFETY: the allocation holds a T, aligned for it.
+        unsafe { ptr.as_ptr().write(value) };
+        LargePageBox { ptr }
+    }
+
     fn layout() -> Layout {
         let size = size_of::<T>().max(1).next_multiple_of(ALIGNMENT);
         Layout::from_size_align(size, ALIGNMENT.max(align_of::<T>())).unwrap()

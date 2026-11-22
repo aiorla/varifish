@@ -2,8 +2,8 @@
 # macOS, for each ARCH of Stockfish's releases that its Makefile takes, with
 # the default network embedded, and attaches the archives to a draft
 # release, to be checked and published by hand. Atomic's network is not
-# included: Atomic-Stockfish's v1.0 release has it. The Linux builds for
-# x86-64-avx2 and x86-64-bmi2 are laid out by BOLT, as `make bolt` does.
+# included: the release `networks` has it. The Linux builds for x86-64-avx2
+# and x86-64-bmi2 are laid out by BOLT, as `make bolt` does.
 name: release
 on:
   push:
@@ -71,13 +71,13 @@ jobs:
         if: matrix.bench
         run: |
           ./"$exe" bench 2>&1 | tee bench.txt
-          grep -q "^Nodes searched  : 1559611$" bench.txt
+          grep -q "^Nodes searched  : 1488683$" bench.txt
       - name: Atomic's bench too, where BOLT moved the code
         if: matrix.bolt
         run: |
           printf 'setoption name UCI_Variant value atomic\nsetoption name EvalFile value %s\nbench\nquit\n' \
-            nets/atomic_run3b_e202_l05.nnue | ./"$exe" 2>&1 | tee atomic.txt
-          grep -q "^Nodes searched  : 292002$" atomic.txt
+            nets/atomic-b0d279b9e021.nnue | ./"$exe" 2>&1 | tee atomic.txt
+          grep -q "^Nodes searched  : 354072$" atomic.txt
       - name: The archive, with the license, the authors and the guide
         run: |
           name=varifish-$GITHUB_REF_NAME-${{ matrix.platform }}-${{ matrix.arch }}

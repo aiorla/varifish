@@ -336,9 +336,10 @@ impl<V: Variant> Position<V> {
             return Err("pos_is_ok: Bitboards");
         }
 
-        for p1 in [PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING] {
-            for p2 in [PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING] {
-                if p1 != p2 && (self.pieces_pt(p1) & self.pieces_pt(p2)).any() {
+        let types = [PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING];
+        for (i, &p1) in types.iter().enumerate() {
+            for &p2 in &types[i + 1..] {
+                if (self.pieces_pt(p1) & self.pieces_pt(p2)).any() {
                     return Err("pos_is_ok: Bitboards");
                 }
             }
@@ -599,8 +600,8 @@ impl Position<Atomic> {
     }
 
     /// Plays a legal move, pushing a new state, and records in `dirties` what
-    /// changed for the network. `prefetcher` is called once the new keys are
-    /// known.
+    /// changed for the network, the threats too if it has a list for them.
+    /// `prefetcher` is called once the new keys are known.
     pub(crate) fn atomic_do_move<P: Prefetcher>(
         &mut self,
         m: Move,
@@ -608,7 +609,31 @@ impl Position<Atomic> {
         dirties: &mut AtomicDirties,
         prefetcher: &P,
     ) {
+        // Two copies of the move, so that the one for networks without
+        // threat features is the move as it was before them.
+        // SAFETY: the stack that pushed the dirties' state is not touched
+        // during the move.
+        match unsafe { dirties.threats.list() } {
+            None => self.atomic_play::<P, false>(m, gives_check, dirties, None, prefetcher),
+            Some(dts) => {
+                self.atomic_play::<P, true>(m, gives_check, dirties, Some(dts), prefetcher)
+            }
+        }
+    }
+
+    /// `atomic_do_move`, recording the threats the move changes in `dts` if
+    /// RECORD.
+    #[inline(never)]
+    fn atomic_play<P: Prefetcher, const RECORD: bool>(
+        &mut self,
+        m: Move,
+        gives_check: bool,
+        dirties: &mut AtomicDirties,
+        dts: Option<&mut AtomicDirtyThreats>,
+        prefetcher: &P,
+    ) {
         debug_assert!(m.is_ok());
+        let mut dts = if RECORD { dts } else { None };
 
         let mut k = self.st().key ^ ZOBRIST.side;
         // SAFETY: the state is pushed below, before `states` changes.
@@ -664,8 +689,8 @@ impl Position<Atomic> {
                 to
             };
 
-            self.remove_exploded(st, &mut k, from);
-            self.remove_exploded(st, &mut k, capsq);
+            self.remove_exploded(st, &mut k, from, dts.as_deref_mut());
+            self.remove_exploded(st, &mut k, capsq, dts.as_deref_mut());
 
             let blast = Blast::new(
                 pseudo_attacks(KING, to) & self.pieces() & !self.pieces_pt(PAWN),
@@ -673,7 +698,7 @@ impl Position<Atomic> {
             );
             for (_, s) in blast.iter() {
                 castling_rights &= !self.castling_rights_mask[s.idx()];
-                self.remove_exploded(st, &mut k, s);
+                self.remove_exploded(st, &mut k, s, dts.as_deref_mut());
             }
             debug_assert!(self.has_king(us));
 
@@ -690,7 +715,25 @@ impl Position<Atomic> {
             debug_assert!(pc == make_piece(us, KING));
 
             let rook = make_piece(us, ROOK);
-            let (rfrom, rto) = self.do_castling::<true>(us, from, &mut to, None, Some(dp));
+            let (rfrom, rto) = match dts {
+                // Castling changes at most 36 threats, which chess's list
+                // holds.
+                Some(dts) => {
+                    let mut castling_dts = DirtyThreats::new();
+                    let squares = self.do_castling::<true>(
+                        us,
+                        from,
+                        &mut to,
+                        Some(&mut castling_dts),
+                        Some(dp),
+                    );
+                    for &threat in &castling_dts {
+                        dts.push(threat);
+                    }
+                    squares
+                }
+                None => self.do_castling::<true>(us, from, &mut to, None, Some(dp)),
+            };
             let keys = ZOBRIST.psq[rook.idx()][rfrom.idx()]
                 ^ ZOBRIST.psq[rook.idx()][rto.idx()]
                 ^ ZOBRIST.psq[pc.idx()][from.idx()]
@@ -722,20 +765,20 @@ impl Position<Atomic> {
                     }
                     st.non_pawn_material[us.idx()] += promotion.value();
 
-                    self.remove_piece(from, None);
-                    self.put_piece(promotion, to, None);
+                    self.atomic_remove_piece(from, dts.as_deref_mut());
+                    self.atomic_put_piece(promotion, to, dts);
                     dp.to = Square::NONE;
                     dp.add_pc = promotion;
                     dp.add_sq = to;
                 } else {
-                    self.move_piece(from, to, None);
+                    self.atomic_move_piece(from, to, dts);
                 }
             } else {
                 st.non_pawn_key[us.idx()] ^= keys;
                 if pc.type_of() <= BISHOP {
                     st.minor_piece_key ^= keys;
                 }
-                self.move_piece(from, to, None);
+                self.atomic_move_piece(from, to, dts);
             }
         }
 
@@ -758,12 +801,14 @@ impl Position<Atomic> {
             }
         }
 
-        let key = if st.rule50 < 14 {
+        // The blast changes the key, so prefetch only now, with the key the
+        // table is probed with, as Atomic-Stockfish does.
+        prefetcher.prefetch_tt(if st.rule50 < 14 {
             k
         } else {
-            k ^ make_key(((st.rule50 - 14) / 8) as u64)
-        };
-        prefetcher.prefetch(key, st, pc, to);
+            k ^ make_key(((st.rule50 - 14) / 8) as u64) << 1
+        });
+        prefetcher.prefetch(st, pc, to);
 
         st.key = k;
         st.checkers_bb = if gives_check {
@@ -774,9 +819,12 @@ impl Position<Atomic> {
 
         self.set_extra_bitboards(st);
 
+        st.piece_placement = pack_pieces(&self.board);
+
         // The distance in plies to the previous occurrence of the same
         // position, negative for a third occurrence, or zero if it did not
-        // occur since the last irreversible move.
+        // occur since the last irreversible move. The piece placement, in
+        // addition to the key, makes it exact.
         st.repetition = 0;
         let end = st.rule50.min(st.plies_from_null);
         if end >= 4 {
@@ -784,7 +832,7 @@ impl Position<Atomic> {
             let mut i = 4;
             while i <= end {
                 let stp = &self.states[n - i as usize];
-                if stp.key == st.key {
+                if stp.key == st.key && stp.piece_placement == st.piece_placement {
                     st.repetition = if stp.repetition != 0 { -i } else { i };
                     break;
                 }
@@ -801,7 +849,13 @@ impl Position<Atomic> {
     /// Removes the piece on `s`, which a capture explodes, from the board and
     /// from the keys and material of `st`; the key is `k`.
     #[inline(always)]
-    fn remove_exploded(&mut self, st: &mut StateInfo<Atomic>, k: &mut Key, s: Square) {
+    fn remove_exploded(
+        &mut self,
+        st: &mut StateInfo<Atomic>,
+        k: &mut Key,
+        s: Square,
+        dts: Option<&mut AtomicDirtyThreats>,
+    ) {
         let pc = self.piece_on(s);
         let c = pc.color();
         let psq = ZOBRIST.psq[pc.idx()][s.idx()];
@@ -820,7 +874,48 @@ impl Position<Atomic> {
             }
         }
 
+        self.atomic_remove_piece(s, dts);
+    }
+
+    /// Removes the piece on `s`, recording in `dts`, if given, the threats
+    /// the removal changes, as chess's `remove_piece` does.
+    #[inline(always)]
+    fn atomic_remove_piece(&mut self, s: Square, dts: Option<&mut AtomicDirtyThreats>) {
+        if let Some(dts) = dts {
+            self.update_piece_threats::<true, _>(self.piece_on(s), false, s, dts, Bitboard::ALL);
+        }
         self.remove_piece(s, None);
+    }
+
+    /// Puts `pc` on `s`, recording in `dts`, if given, the threats it
+    /// changes, as chess's `put_piece` does.
+    #[inline(always)]
+    fn atomic_put_piece(&mut self, pc: Piece, s: Square, dts: Option<&mut AtomicDirtyThreats>) {
+        self.put_piece(pc, s, None);
+        if let Some(dts) = dts {
+            self.update_piece_threats::<true, _>(pc, true, s, dts, Bitboard::ALL);
+        }
+    }
+
+    /// Moves the piece on `from` to the empty `to`, recording in `dts`, if
+    /// given, the threats the move changes, as chess's `move_piece` does.
+    #[inline(always)]
+    fn atomic_move_piece(
+        &mut self,
+        from: Square,
+        to: Square,
+        dts: Option<&mut AtomicDirtyThreats>,
+    ) {
+        match dts {
+            None => self.move_piece(from, to, None),
+            Some(dts) => {
+                let pc = self.piece_on(from);
+                let from_to = from | to;
+                self.update_piece_threats::<true, _>(pc, false, from, dts, from_to);
+                self.move_piece(from, to, None);
+                self.update_piece_threats::<true, _>(pc, true, to, dts, from_to);
+            }
+        }
     }
 
     /// Unmakes a move, restoring the position exactly as it was before it.
@@ -859,6 +954,34 @@ impl Position<Atomic> {
         self.game_ply -= 1;
 
         debug_assert_eq!(self.check(), Ok(()));
+    }
+
+    /// What a capture of the side to move explodes: the other side's pieces
+    /// less its own, the capturer included, in the values of the static
+    /// exchange evaluation below, which counts the same blast. Kings count
+    /// nothing.
+    pub fn atomic_blast_value(&self, m: Move) -> Value {
+        debug_assert!(self.capture(m));
+
+        let us = self.side_to_move;
+        let to = m.to_sq();
+        let victim = if m.type_of() == EN_PASSANT {
+            make_piece(!us, PAWN)
+        } else {
+            self.piece_on(to)
+        };
+        let mut value = ATOMIC_CAPTURE_PIECE_VALUE[victim.idx()]
+            - ATOMIC_CAPTURE_PIECE_VALUE[self.moved_piece(m).idx()];
+        let bystanders = pseudo_attacks(KING, to)
+            & self.pieces()
+            & !self.pieces_pt(PAWN)
+            & !square_bb(m.from_sq());
+        for s in bystanders {
+            let pc = self.piece_on(s);
+            let v = ATOMIC_CAPTURE_PIECE_VALUE[pc.idx()];
+            value += if pc.color() == us { -v } else { v };
+        }
+        value
     }
 
     /// Tests whether Atomic-Stockfish's static exchange evaluation of a move

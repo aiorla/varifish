@@ -41,6 +41,20 @@ fn main() {
         ]
         .iter()
         .all(|f| has(f));
+    // Stockfish's USE_PEXT, which its bmi2 and AVX-512 builds define and
+    // its avx2 build doesn't, for AMD's Zen 1 and 2, whose pext is slow. The
+    // Makefile says which its ARCH is in VARIFISH_PEXT, as varifish's avx2
+    // and bmi2 builds otherwise target the same instructions; without it, a
+    // build with bmi2 has pext unless it runs on one of those processors, as
+    // Stockfish's get_native_properties.sh chooses for ARCH=native.
+    println!("cargo::rerun-if-env-changed=VARIFISH_PEXT");
+    let use_pext = use_avx2
+        && has("bmi2")
+        && match env::var("VARIFISH_PEXT").as_deref() {
+            Ok("yes") => true,
+            Ok("no") => false,
+            _ => !has_slow_bmi2(),
+        };
     let use_neon = arch == "aarch64" && has("neon");
     let use_neon_dotprod = use_neon && has("dotprod");
     let use_simd128 = arch == "wasm32" && has("simd128");
@@ -53,6 +67,7 @@ fn main() {
         ("use_avx512", use_avx512),
         ("use_vnni", use_vnni),
         ("use_avx512icl", use_avx512icl),
+        ("use_pext", use_pext),
         ("use_neon", use_neon),
         ("use_neon_dotprod", use_neon_dotprod),
         ("use_simd128", use_simd128),
@@ -113,4 +128,21 @@ fn main() {
         "cargo::rustc-env=VARIFISH_EMBEDDED_NETWORK={}",
         embedded.display()
     );
+}
+
+/// Whether this machine is an AMD Excavator, Zen 1 or Zen 2 (families 21
+/// and 23), whose bmi2 instructions are slow, as Stockfish's
+/// get_native_properties.sh tells them.
+fn has_slow_bmi2() -> bool {
+    let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") else {
+        return false;
+    };
+    let field = |name: &str| {
+        cpuinfo.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key.trim() == name).then(|| value.trim().to_owned())
+        })
+    };
+    field("vendor_id").as_deref() == Some("AuthenticAMD")
+        && matches!(field("cpu family").as_deref(), Some("21" | "23"))
 }

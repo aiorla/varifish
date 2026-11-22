@@ -861,6 +861,7 @@ impl<V: Variant> SearchManager<V> {
                     &mut v,
                     multi_pv,
                     &self.updates,
+                    &sh.stop,
                 );
             }
 
@@ -876,7 +877,7 @@ impl<V: Variant> SearchManager<V> {
                 .join(" ");
 
             let wdl = if options.show_wdl {
-                wdl(v, pos).unwrap_or_default()
+                wdl(v, pos)
             } else {
                 String::new()
             };
@@ -932,16 +933,21 @@ fn syzygy_extend_pv<V: Variant>(
     v: &mut Value,
     multi_pv: usize,
     updates: &UpdateContext,
+    stop: &AtomicBool,
 ) {
     let t_start = Instant::now();
     let move_overhead = options.move_overhead;
     let rule50 = options.syzygy.rule50;
 
     // Do not use more than moveOverhead / 2 ms, if time management is
-    // active. Under 'nodestime' the pos.do_move() calls come for free.
+    // active. Under 'nodestime' the pos.do_move() calls come for free. As
+    // Atomic-Stockfish, Atomic also keeps to it once an infinite search is
+    // stopped: the GUI then waits for bestmove, and the DTZ probes can take
+    // seconds on cold tables.
     let time_abort = || {
         limits.npmsec == 0
-            && limits.use_time_management()
+            && (limits.use_time_management()
+                || (V::ATOMIC && limits.infinite != 0 && stop.load(Relaxed)))
             && 2.0 * multi_pv as f64 * t_start.elapsed().as_secs_f64() * 1000.0
                 >= f64::from(move_overhead)
     };
@@ -1076,8 +1082,8 @@ fn syzygy_extend_pv<V: Variant>(
     }
 }
 
-/// What a search prefetches as it makes a move: the transposition table
-/// entry and the shared histories of the position after it.
+/// What a search prefetches as it makes a move: the shared histories of the
+/// position after it, and in Atomic its transposition table cluster.
 struct SearchPrefetch<'a> {
     tt: &'a TranspositionTable,
     histories: &'a SharedHistories,
@@ -1085,8 +1091,12 @@ struct SearchPrefetch<'a> {
 
 impl Prefetcher for SearchPrefetch<'_> {
     #[inline(always)]
-    fn prefetch<V: Variant>(&self, key: Key, st: &StateInfo<V>, pc: Piece, to: Square) {
-        prefetch(self.tt.first_entry(key));
+    fn prefetch_tt(&self, key: Key) {
+        prefetch(self.tt.get_cluster(key));
+    }
+
+    #[inline(always)]
+    fn prefetch<V: Variant>(&self, st: &StateInfo<V>, pc: Piece, to: Square) {
         prefetch(&self.histories.pawn_entry_at(st.pawn_key)[pc.idx()][to.idx()]);
         prefetch(self.histories.correction_entry(st.pawn_key));
         prefetch(self.histories.correction_entry(st.minor_piece_key));
@@ -1216,7 +1226,7 @@ impl<V: Variant> Worker<V> {
     pub unsafe fn clear(&mut self, sh: &SharedState) {
         // Atomic's values are Atomic-Stockfish's
         let (capture, correction, pawn, continuation) = if V::ATOMIC {
-            (-699, -6, -1262, -552)
+            (-712, -7, -1297, -533)
         } else {
             (-742, -5, -1338, -586)
         };
@@ -1258,7 +1268,8 @@ impl<V: Variant> Worker<V> {
     /// from the root position and, on the main thread, outputs the
     /// "bestmove".
     pub fn start_searching(&mut self, sh: &Arc<SharedState>) {
-        self.accumulator_stack.reset();
+        self.accumulator_stack
+            .reset(V::eval_file(&sh.networks).network());
 
         // The root position is searched outside the worker.
         let mut pos = std::mem::take(&mut self.root_pos);
@@ -1501,12 +1512,12 @@ impl<V: Variant> Worker<V> {
 
         let mut alpha;
         let mut beta;
-        let mut best_value = -VALUE_INFINITE;
         let us = pos.side_to_move();
         let mut time_reduction = 1.0;
         let mut tot_best_move_changes = 0.0;
         let mut delta;
         let mut iter_idx = 0;
+        let mut total_effort: u64 = 0;
 
         // The stack starts at zero, with the seven entries before the root
         // pointing to the sentinel histories, as the continuation histories
@@ -1549,11 +1560,11 @@ impl<V: Variant> Worker<V> {
         // Atomic's values here and below are Atomic-Stockfish's
         self.hist
             .low_ply_history
-            .fill(if V::ATOMIC { 100 } else { 102 });
+            .fill(if V::ATOMIC { 99 } else { 102 });
 
         // Both colors' entries, through one slice: indexed through the box,
         // each store reloads its pointer, and the loop is not vectorized.
-        let main_history_keep = if V::ATOMIC { 789 } else { 729 };
+        let main_history_keep = if V::ATOMIC { 785 } else { 729 };
         for entry in self.hist.main_history.as_flattened_mut() {
             entry.set(entry.get() * main_history_keep / 1024);
         }
@@ -1565,6 +1576,10 @@ impl<V: Variant> Worker<V> {
             && !(self.limits.depth != 0 && main_thread && self.root_depth >= self.limits.depth)
         {
             self.root_depth += 1;
+
+            // Do not tune these values. They are not intended for playing
+            // strength.
+            let seek_mate_threshold = 750 + 220000 / (self.root_depth * self.root_depth);
 
             // Signal the start of a new iteration
             if main_thread {
@@ -1612,7 +1627,7 @@ impl<V: Variant> Worker<V> {
                 self.sel_depth = 0;
 
                 // Reset aspiration window starting size
-                let mean_squared_div = if V::ATOMIC { 10588 } else { 10193 };
+                let mean_squared_div = if V::ATOMIC { 10994 } else { 10193 };
                 delta = 5
                     + (self.thread_idx % 8) as i32
                     + self.root_moves[pv_idx].mean_squared_score.abs() / mean_squared_div;
@@ -1620,24 +1635,13 @@ impl<V: Variant> Worker<V> {
                 alpha = (avg - delta).max(-VALUE_INFINITE);
                 beta = (avg + delta).min(VALUE_INFINITE);
 
-                // Do not tune these values. They are not intended for
-                // playing strength. Atomic reads the previous score, as
-                // Atomic-Stockfish does: searching an earlier MultiPV line
-                // leaves the moves that failed low at -VALUE_INFINITE.
-                let root_score = if V::ATOMIC {
-                    self.root_moves[pv_idx].previous_score
-                } else {
-                    self.root_moves[pv_idx].score
-                };
-                self.seek_mate = (!V::ATOMIC || root_score != -VALUE_INFINITE)
-                    && root_score.abs() >= 750 + 220000 / (self.root_depth * self.root_depth);
+                let previous_score = self.root_moves[pv_idx].previous_score;
+                self.seek_mate = previous_score != -VALUE_INFINITE
+                    && previous_score.abs() >= seek_mate_threshold;
 
-                // Adjust optimism based on root move's averageScore
-                self.optimism[us.idx()] = if V::ATOMIC {
-                    137 * avg / (avg.abs() + 81)
-                } else {
-                    114 * avg / (avg.abs() + 85)
-                };
+                // Adjust optimism based on root move's averageScore. Atomic's
+                // evaluation reads none.
+                self.optimism[us.idx()] = 456 * avg / (avg.abs() + 85);
                 self.optimism[(!us).idx()] = -self.optimism[us.idx()];
 
                 // Start with a small aspiration window and, in the case of a
@@ -1655,7 +1659,7 @@ impl<V: Variant> Worker<V> {
                         - fail_high_recovery
                         - 3 * (search_again_counter + 1) / 4)
                         .max(1);
-                    best_value = V::search_root(self, sh, pos, alpha, beta, adjusted_depth);
+                    let best_value = V::search_root(self, sh, pos, alpha, beta, adjusted_depth);
 
                     // Bring the best move to the front. It is critical that
                     // sorting is done with a stable algorithm because all
@@ -1703,7 +1707,7 @@ impl<V: Variant> Worker<V> {
                         break;
                     }
 
-                    let growth = if V::ATOMIC { 44 } else { 47 };
+                    let growth = if V::ATOMIC { 45 } else { 47 };
                     delta += growth * delta / 128;
 
                     debug_assert!(alpha >= -VALUE_INFINITE && beta <= VALUE_INFINITE);
@@ -1778,6 +1782,12 @@ impl<V: Variant> Worker<V> {
                 {
                     self.output_pv(sh, pos, self.root_depth);
                     uci_pv_sent = pv_idx + 1 == multi_pv;
+                }
+
+                // The first line's nodes, which its best move's effort is
+                // weighed against, whatever the MultiPV
+                if main_thread && pv_idx == 0 {
+                    total_effort = self.nodes();
                 }
 
                 if sh.stop.load(Relaxed) {
@@ -1870,10 +1880,12 @@ impl<V: Variant> Worker<V> {
                 && !sh.stop.load(Relaxed)
                 && !self.main_manager().stop_on_ponderhit
             {
-                let nodes_effort = self.root_moves[0].effort * 100000 / self.nodes().max(1);
+                let nodes_effort = self.root_moves[0].effort * 100000 / total_effort.max(1);
+                let best_score = self.root_moves[0].score;
                 let num_threads = self.num_threads;
                 let root_depth = self.root_depth;
                 let single_move = self.root_moves.len() == 1;
+                let npmsec = self.limits.npmsec.max(1);
                 let stop_score = self.root_moves[multi_pv - 1].score >= mate_in(3)
                     || self.root_moves[0].score == mated_in(2);
                 let manager = self.main_manager();
@@ -1886,10 +1898,10 @@ impl<V: Variant> Worker<V> {
                 let (base, average_weight, iter_weight) = tc.falling_eval;
                 let falling_eval = mul_add(
                     iter_weight,
-                    f64::from(manager.iter_value[iter_idx] - best_value),
+                    f64::from(manager.iter_value[iter_idx] - best_score),
                     mul_add(
                         average_weight,
-                        f64::from(manager.best_previous_average_score - best_value),
+                        f64::from(manager.best_previous_average_score - best_score),
                         base,
                     ),
                 ) / 100.0;
@@ -1934,7 +1946,7 @@ impl<V: Variant> Worker<V> {
 
                 if single_move {
                     // Cap used time for a better viewer experience
-                    total_time = min_f64(tc.single_move_time, total_time);
+                    total_time = min_f64(tc.single_move_time * npmsec as f64, total_time);
                 }
 
                 let elapsed_time = manager.tm.elapsed(|| manager.nodes_searched());
@@ -1961,7 +1973,7 @@ impl<V: Variant> Worker<V> {
                 }
             }
 
-            self.main_manager().iter_value[iter_idx] = best_value;
+            self.main_manager().iter_value[iter_idx] = self.root_moves[0].score;
             iter_idx = (iter_idx + 1) & 3;
         }
 
@@ -1974,17 +1986,26 @@ impl<V: Variant> Worker<V> {
         // If the skill level is enabled, swap the best PV line with the
         // sub-optimal one
         if skill.enabled() {
-            let best = if skill.best != Move::none() {
+            let pick = if skill.best != Move::none() {
                 skill.best
             } else {
                 skill.pick_best(&self.root_moves, multi_pv)
             };
-            let i = self
-                .root_moves
-                .iter()
-                .position(|rm| rm.pv[0] == best)
-                .expect("the skill picks a root move");
-            self.root_moves.swap(0, i);
+            if pick != self.root_moves[0].pv[0] {
+                let best_score = self.root_moves[0].score;
+                let i = self
+                    .root_moves
+                    .iter()
+                    .position(|rm| rm.pv[0] == pick)
+                    .expect("the skill picks a root move");
+                self.root_moves.swap(0, i);
+                // A mated score of a worse line is only a bound: the best
+                // line's mate may be further away.
+                if is_loss(self.root_moves[0].score) && self.root_moves[0].score < best_score {
+                    self.root_moves[0].inexact_lower = true;
+                }
+                uci_pv_sent = false;
+            }
         }
 
         uci_pv_sent
@@ -2017,8 +2038,11 @@ impl<V: Variant> Worker<V> {
         // prefetch_key() does not model castling, en passant or promotion
         // exactly. The correction-history prefetches also approximate
         // castling and promotion. For these rare moves the prefetches land
-        // on unused lines.
-        prefetch(sh.tt.first_entry(pos.prefetch_key(mv)));
+        // on unused lines. Nor does it model an Atomic capture's blast: as
+        // Atomic-Stockfish, Atomic's do_move prefetches the key after it.
+        if !V::ATOMIC || !pos.capture(mv) {
+            prefetch(sh.tt.get_cluster(pos.prefetch_key(mv)));
+        }
 
         let pc = pos.moved_piece(mv);
         let to = mv.to_sq();
@@ -2031,7 +2055,7 @@ impl<V: Variant> Worker<V> {
 
         increment(&self.counters.nodes);
 
-        let dirties = self.accumulator_stack.push();
+        let dirties = self.accumulator_stack.push(pos);
         pos.do_move_prefetching(
             mv,
             gives_check,
@@ -2493,7 +2517,9 @@ impl<V: Variant> Worker<V> {
                 debug_assert!(self.stack[ss - 1].current_move != Move::null());
 
                 // Null move dynamic reduction based on depth
-                let mut r = 7 + depth / 3 + ((self.stack[ss].static_eval - beta) / 256).max(0);
+                // Odd threads reduce one ply less
+                let mut r = 7 + depth / 3 + ((self.stack[ss].static_eval - beta) / 256).max(0)
+                    - (self.thread_idx & 1) as i32;
                 r -= self.seek_mate as i32 * r / 2;
                 self.do_null_move(pos, ss);
 
@@ -2779,10 +2805,7 @@ impl<V: Variant> Worker<V> {
                     // (*Scaler): Generally, more frequent futility pruning
                     // scales well
                     if !self.stack[ss].in_check && lmr_depth < 12 && futility_value <= alpha {
-                        if best_value <= futility_value
-                            && !is_decisive(best_value)
-                            && !is_win(futility_value)
-                        {
+                        if best_value <= futility_value && !is_win(futility_value) {
                             best_value = futility_value;
                         }
                         continue;
@@ -3233,7 +3256,6 @@ impl<V: Variant> Worker<V> {
                 &captures_searched,
                 depth,
                 tt_data.mv,
-                pv_node,
             );
             if !pv_node {
                 self.tt_move_history
@@ -3684,15 +3706,16 @@ impl<V: Variant> Worker<V> {
 
     #[inline(always)]
     fn correction_value(&self, sh: &SharedState, pos: &Position<V>, ss: usize) -> i32 {
-        let us = pos.side_to_move().idx();
         let m = self.stack[ss - 1].current_move;
         let shared = &sh.histories;
-        let pcv = shared.pawn_correction_entry(pos)[us].pawn.get();
-        let micv = shared.minor_piece_correction_entry(pos)[us].minor.get();
-        let wnpcv = shared.nonpawn_correction_entry(pos, WHITE)[us]
+        let pcv = shared.pawn_correction_entry(pos).pawn.get();
+        let micv = shared.minor_piece_correction_entry(pos).minor.get();
+        let wnpcv = shared
+            .nonpawn_correction_entry(pos, WHITE)
             .non_pawn_white
             .get();
-        let bnpcv = shared.nonpawn_correction_entry(pos, BLACK)[us]
+        let bnpcv = shared
+            .nonpawn_correction_entry(pos, BLACK)
             .non_pawn_black
             .get();
         let cntcv = if m.is_ok() {
@@ -3716,19 +3739,21 @@ impl<V: Variant> Worker<V> {
         bonus: i32,
     ) {
         let m = self.stack[ss - 1].current_move;
-        let us = pos.side_to_move().idx();
 
         const NON_PAWN_WEIGHT: i32 = 186;
         let shared = &sh.histories;
 
-        shared.pawn_correction_entry(pos)[us].pawn.update(bonus);
-        shared.minor_piece_correction_entry(pos)[us]
+        shared.pawn_correction_entry(pos).pawn.update(bonus);
+        shared
+            .minor_piece_correction_entry(pos)
             .minor
             .update(bonus * 150 / 128);
-        shared.nonpawn_correction_entry(pos, WHITE)[us]
+        shared
+            .nonpawn_correction_entry(pos, WHITE)
             .non_pawn_white
             .update(bonus * NON_PAWN_WEIGHT / 128);
-        shared.nonpawn_correction_entry(pos, BLACK)[us]
+        shared
+            .nonpawn_correction_entry(pos, BLACK)
             .non_pawn_black
             .update(bonus * NON_PAWN_WEIGHT / 128);
 
@@ -3771,7 +3796,6 @@ impl<V: Variant> Worker<V> {
         captures_searched: &SearchedList,
         depth: Depth,
         tt_move: Move,
-        pv_node: bool,
     ) {
         let moved_piece = pos.moved_piece(best_move);
 
@@ -3780,12 +3804,10 @@ impl<V: Variant> Worker<V> {
             + self.stack[ss - 1].stat_score / 28;
         let malus = (968 * depth - 235).min(2244);
 
-        if !pv_node {
-            // Stockfish multiplies in unsigned 64-bit arithmetic, which
-            // amounts to rounding the quotient down.
-            let searched = (quiets_searched.len() + captures_searched.len()) as i64;
-            bonus += (i64::from(bonus) * searched).div_euclid(256) as i32;
-        }
+        // Stockfish multiplies in unsigned 64-bit arithmetic, which amounts
+        // to rounding the quotient down.
+        let searched = (quiets_searched.len() + captures_searched.len()) as i64;
+        bonus += (i64::from(bonus) * searched).div_euclid(256) as i32;
 
         if !pos.capture_stage(best_move) {
             self.update_quiet_histories(sh, pos, ss, best_move, bonus * 899 / 1024);

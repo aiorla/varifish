@@ -263,45 +263,6 @@ impl AccumulatorStack {
     }
 }
 
-impl crate::nnue::Accumulators for AccumulatorStack {
-    type Dirties = AtomicDirties;
-
-    #[inline(always)]
-    fn new() -> LargePageBox<Self> {
-        AccumulatorStack::new()
-    }
-
-    #[inline(always)]
-    fn reset(&mut self) {
-        AccumulatorStack::reset(self);
-    }
-
-    #[inline(always)]
-    fn push(&mut self) -> &mut AtomicDirties {
-        AccumulatorStack::push(self)
-    }
-
-    #[inline(always)]
-    fn pop(&mut self) {
-        AccumulatorStack::pop(self);
-    }
-}
-
-impl crate::nnue::Caches for AccumulatorCaches {
-    type Network = Network;
-
-    fn new(network: Option<&Network>) -> LargePageBox<Self> {
-        match network {
-            Some(network) => AccumulatorCaches::new(network),
-            None => AccumulatorCaches::empty(),
-        }
-    }
-
-    fn clear(&mut self, network: &Network) {
-        AccumulatorCaches::clear(self, network);
-    }
-}
-
 // The accumulations are updated a tile at a time, the vectors of each kept
 // in registers while every weight row is applied to it. The functions on
 // tiles take the index `j` of the tile's first value, a multiple of

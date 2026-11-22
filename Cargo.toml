@@ -1,6 +1,6 @@
 [package]
 name = "varifish"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98"
 publish = false
@@ -11,8 +11,8 @@ license = "GPL-3.0-or-later"
 # Atomic-Stockfish commit whose Atomic rules, evaluation and tablebase probes
 # it reproduces.
 [package.metadata.upstream]
-stockfish = "effdc3fd3f6de6e75fe1374a51a7a7eed66f880b"
-atomic-stockfish = "8e81598f0dc8133fc3ee24ba6128327af58f4534"
+stockfish = "1c6f497afc176044b2feca9ce74a7bdce9e7e0cb"
+atomic-stockfish = "00f68d61ddf1e5730956f51fcbfed1d072e54131"
 
 [dependencies]
 

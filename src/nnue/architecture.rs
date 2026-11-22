@@ -18,7 +18,7 @@ use super::nnz_helper::NnzInfo;
 
 // Input features used in evaluation function
 pub use super::features::full_threats::FullThreats as ThreatFeatureSet;
-pub use super::features::k32q2::K32Q2 as PsqFeatureSet;
+pub use super::features::k32h3::K32H3 as PsqFeatureSet;
 pub use super::features::pp_3wide::Pp3Wide as PairFeatureSet;
 
 /// Number of input feature dimensions after conversion
@@ -26,7 +26,11 @@ pub const L1: usize = 1024;
 pub const L2: usize = 32;
 pub const L3: usize = 32;
 
-pub const LAYER_STACKS: usize = 32;
+/// The layer stacks a position can select, by its number of pieces, its
+/// queens, where its pawns stand and how many officers each side has. A file
+/// may store fewer and map the others to stored ones.
+pub const RAW_LAYER_STACKS: usize = 192;
+pub const LAYER_STACKS: usize = RAW_LAYER_STACKS;
 
 const TRANSFORMED_FEATURE_DIMENSIONS: usize = L1;
 const FC_0_OUTPUTS: usize = L2;

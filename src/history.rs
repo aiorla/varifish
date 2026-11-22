@@ -16,7 +16,7 @@ use crate::variant::Variant;
 
 pub const PAWN_HISTORY_BASE_SIZE: usize = 8192; // has to be a power of 2
 pub const UINT_16_HISTORY_SIZE: usize = u16::MAX as usize + 1;
-pub const CORRHIST_BASE_SIZE: usize = UINT_16_HISTORY_SIZE;
+pub const CORRHIST_BASE_SIZE: usize = 2 * UINT_16_HISTORY_SIZE;
 pub const CORRECTION_HISTORY_LIMIT: i32 = 1024;
 pub const LOW_PLY_HISTORY_SIZE: usize = 5;
 
@@ -220,9 +220,9 @@ impl FillShared for CorrectionBundle {
     }
 }
 
-/// The correction histories of a pawn, minor piece or non-pawn key, for each
-/// side to move.
-pub type CorrectionEntry = [CorrectionBundle; COLOR_NB];
+/// The correction histories of a pawn, minor piece or non-pawn key, whose
+/// lowest bit is the side to move.
+pub type CorrectionEntry = CorrectionBundle;
 
 pub type TTMoveHistory = StatsEntry<8192>;
 
@@ -326,7 +326,8 @@ impl SharedHistories {
 
     #[inline(always)]
     pub fn pawn_entry_at(&self, pawn_key: Key) -> &PawnHistoryEntry {
-        let index = pawn_key as usize & self.pawn_hist_size_minus1;
+        // The lowest bit is the side to move, which the pawn history ignores.
+        let index = (pawn_key >> 1) as usize & self.pawn_hist_size_minus1;
         // SAFETY: the index is masked to the length minus one, a power of
         // two minus one.
         unsafe { self.pawn_history.data.get_unchecked(index) }
@@ -402,7 +403,7 @@ mod tests {
         );
         // SAFETY: one thread.
         unsafe { histories.correction_history.clear_range(-5, 0, 1) };
-        let e = &histories.correction_entry(0x1234_5678_9abc_def0)[BLACK.idx()];
+        let e = histories.correction_entry(0x1234_5678_9abc_def1);
         assert_eq!(e.non_pawn_black.get(), -5);
     }
 }

@@ -3,7 +3,9 @@
 //! the search to test, and for the threats it weighs quiet moves by, which
 //! the position keeps, seeing through the king as chess's do. It has no
 //! evasion stage: a side in check picks captures, then quiet moves, as a side
-//! out of check does.
+//! out of check does. It orders captures by what their blast explodes, where
+//! Atomic-Stockfish's orders them by the piece taken, so the threshold
+//! between good and bad captures follows the blast too.
 //!
 //! A translation into Rust, modified for varifish in 2026, of
 //! Atomic-Stockfish's `movepick.cpp` (https://github.com/Belzedar94/Atomic-Stockfish),
@@ -13,6 +15,28 @@
 
 use super::*;
 use crate::variant::Atomic;
+
+// The stages of Atomic's move picker, those of chess's before Stockfish
+// merged them, and with their numbers, where 7 to 9 were chess's evasions.
+
+// generate main search moves
+const MAIN_TT: Stage = 0;
+const CAPTURE_INIT: Stage = 1;
+const GOOD_CAPTURE: Stage = 2;
+const QUIET_INIT: Stage = 3;
+const GOOD_QUIET: Stage = 4;
+const BAD_CAPTURE: Stage = 5;
+const BAD_QUIET: Stage = 6;
+
+// generate probcut moves
+const PROBCUT_TT: Stage = 10;
+const PROBCUT_INIT: Stage = 11;
+const PROBCUT: Stage = 12;
+
+// generate qsearch moves
+const QSEARCH_TT: Stage = 13;
+const QCAPTURE_INIT: Stage = 14;
+const QCAPTURE: Stage = 15;
 
 /// The MovePicker of Atomic, which picks one legal move at a time.
 /// next_move() emits one new legal move on every call, until there
@@ -128,8 +152,8 @@ impl<'a> AtomicMovePicker<'a> {
     }
 
     /// Assigns a numerical value to each move in a list, used for sorting,
-    /// and writes them from `cur`. Captures are ordered by Most Valuable
-    /// Victim (MVV), preferring captures with a good history. Quiet moves are
+    /// and writes them from `cur`. Captures are ordered by what their blast
+    /// explodes, preferring captures with a good history. Quiet moves are
     /// ordered using the history tables. Returns the end of the moves
     /// written.
     #[inline(always)]
@@ -159,6 +183,11 @@ impl<'a> AtomicMovePicker<'a> {
         let pawn_entry = shared.pawn_entry(pos);
         let main_history = &h.main_history[us.idx()];
         let ch = self.continuation_history;
+        let low_ply_history = if T == QUIETS && self.ply < LOW_PLY_HISTORY_SIZE as i32 {
+            Some(&h.low_ply_history[self.ply as usize])
+        } else {
+            None
+        };
 
         let mut it = self.cur;
         for &m in ml {
@@ -169,8 +198,15 @@ impl<'a> AtomicMovePicker<'a> {
             let captured_piece = pos.piece_on(to);
 
             let value = if T == CAPTURES {
+                // A capture is worth what its blast explodes, a queen
+                // promotion that captures nothing its history alone.
+                let gain = if pos.capture(m) {
+                    pos.atomic_blast_value(m)
+                } else {
+                    0
+                };
                 h.capture_history[pc.idx()][to.idx()][captured_piece.type_of().idx()].get()
-                    + 7 * captured_piece.value()
+                    + 110 * gain / 16
             } else {
                 // histories
                 let mut value = 2 * main_history[m.raw() as usize].get();
@@ -181,18 +217,19 @@ impl<'a> AtomicMovePicker<'a> {
                 value += ch[3][pc.idx()][to.idx()].get();
                 value += ch[5][pc.idx()][to.idx()].get();
 
-                // bonus for checks
-                value += (pos.check_squares(pt).has(to) && pos.see_ge(m, -75)) as i32 * 16384;
-
                 // penalty for moving to a square threatened by a lesser
                 // piece or bonus for escaping an attack by a lesser piece.
                 let threats = threat_by_lesser[pt.idx() & 7];
                 let v = 20 * (threats.has(from) as i32 - threats.has(to) as i32);
                 value += PIECE_VALUE[pt.idx()] * v;
 
-                if self.ply < LOW_PLY_HISTORY_SIZE as i32 {
-                    let ply = self.ply as usize;
-                    value += 8 * h.low_ply_history[ply][m.raw() as usize].get() / (1 + self.ply);
+                if let Some(lph) = low_ply_history {
+                    value += 8 * lph[m.raw() as usize].get() / (1 + self.ply);
+                }
+
+                // bonus for checks
+                if pos.check_squares(pt).has(to) && pos.see_ge(m, -75) {
+                    value += 16384;
                 }
 
                 value
@@ -324,7 +361,7 @@ impl<'a> AtomicMovePicker<'a> {
                             while self.cur < self.end_cur {
                                 let m = self.get(self.cur);
                                 if m.mv != self.tt_move {
-                                    if pos.see_ge(m.mv, -m.value / 18) {
+                                    if pos.see_ge(m.mv, -m.value * 16 / 285) {
                                         self.cur += 1;
                                         return m.mv;
                                     }
@@ -389,5 +426,29 @@ impl<'a> AtomicMovePicker<'a> {
 
     pub fn skip_quiet_moves(&mut self) {
         self.skip_quiets = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::uci::move_to_uci;
+    use crate::variant::Chess;
+
+    #[test]
+    fn captures_are_ordered_by_their_blast() {
+        // Bxb7 takes a rook, but bxc5 explodes the queen next to the pawn.
+        let fen = "7k/1r6/3q4/2p5/1P6/8/6B1/4K3 w - - 0 1";
+        let shared = SharedHistories::new(1);
+        let h = WorkerHistories::new();
+        let ch = [shared.continuation(0); 6];
+
+        let pos = Position::<Atomic>::from_fen(fen, false).unwrap();
+        let mut mp = AtomicMovePicker::new(&pos, Move::none(), DEPTH_QS, ch, 0);
+        assert_eq!(move_to_uci(mp.next_move(&pos, &h, &shared), false), "b4c5");
+
+        let pos = Position::<Chess>::from_fen(fen, false).unwrap();
+        let mut mp = MovePicker::new(&pos, Move::none(), DEPTH_QS, ch, 0);
+        assert_eq!(move_to_uci(mp.next_move(&pos, &h, &shared), false), "g2b7");
     }
 }

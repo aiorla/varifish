@@ -21,7 +21,6 @@ use crate::nnue::common::{
     Aligned, MAX_SIMD_WIDTH, OUTPUT_SCALE, Reader, WEIGHT_SCALE_BITS, ceil_to_multiple, write_i16s,
     write_i32s, write_u32,
 };
-use crate::nnue::eval_file::NetworkFile;
 use crate::nnue::feature_transformer::{INVERSE_PACKUS_EPI16_ORDER, PACKUS_EPI16_ORDER, permute};
 use crate::nnue::layers::affine_transform::AffineTransform;
 use crate::nnue::layers::affine_transform_sparse_input::AffineTransformSparseInput;
@@ -35,10 +34,6 @@ use crate::variant::Atomic;
 
 /// Version of the evaluation file, Stockfish's of 2021
 pub const VERSION: u32 = 0x7AF3_2F20;
-
-/// The network Atomic-Stockfish evaluates with by default, run3b, which is
-/// not embedded
-pub const EVAL_FILE_DEFAULT_NAME: &str = "atomic_run3b_e202_l05.nnue";
 
 /// Number of accumulators of one perspective
 pub const HALF_DIMENSIONS: usize = 512;
@@ -416,6 +411,16 @@ impl Network {
         (psqt, positional)
     }
 
+    /// The size in MiB and the dimensions, as verify reports them.
+    pub fn size_and_dimensions() -> String {
+        let size =
+            size_of::<FeatureTransformer>() + size_of::<NetworkArchitecture>() * LAYER_STACKS;
+        format!(
+            "({}MiB, ({INPUT_DIMENSIONS}, {OUTPUT_DIMENSIONS}, {FC_0_OUTPUTS}, {FC_1_OUTPUTS}, 1))",
+            size / (1024 * 1024)
+        )
+    }
+
     /// The evaluation by each layer stack.
     pub fn trace_evaluate(
         &self,
@@ -449,33 +454,6 @@ impl Network {
             }),
             correct_bucket: bucket(pos),
         }
-    }
-}
-
-impl NetworkFile for Network {
-    const DEFAULT_NAME: &'static str = EVAL_FILE_DEFAULT_NAME;
-    const KIND: &'static str = "Legacy Atomic V1 ";
-
-    fn read(bytes: &[u8]) -> Option<(LargePageBox<Network>, Vec<u8>)> {
-        Network::read(bytes)
-    }
-
-    fn write(&self, description: &[u8]) -> Vec<u8> {
-        Network::write(self, description)
-    }
-
-    fn download_url() -> String {
-        "https://github.com/Belzedar94/Atomic-Stockfish/releases/download/v1.0/atomic-run3b.nnue"
-            .to_string()
-    }
-
-    fn size_and_dimensions() -> String {
-        let size =
-            size_of::<FeatureTransformer>() + size_of::<NetworkArchitecture>() * LAYER_STACKS;
-        format!(
-            "({}MiB, ({INPUT_DIMENSIONS}, {OUTPUT_DIMENSIONS}, {FC_0_OUTPUTS}, {FC_1_OUTPUTS}, 1))",
-            size / (1024 * 1024)
-        )
     }
 }
 

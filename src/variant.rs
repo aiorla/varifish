@@ -34,7 +34,7 @@ pub trait Variant: Copy + Default + fmt::Debug + Eq + Send + Sync + 'static {
     /// The network that evaluates the variant
     type Network: NetworkFile;
     /// The network's accumulators along a search's line
-    type Accumulators: Accumulators<Dirties = Self::Dirties>;
+    type Accumulators: Accumulators<Self, Dirties = Self::Dirties>;
     /// A search thread's caches of the network's accumulators
     type Caches: Caches<Network = Self::Network>;
 
@@ -239,9 +239,9 @@ impl Variant for Atomic {
 
     type StateExtra = crate::position::AtomicState;
     type Dirties = AtomicDirties;
-    type Network = crate::nnue::atomic::network::Network;
-    type Accumulators = crate::nnue::atomic::accumulator::AccumulatorStack;
-    type Caches = crate::nnue::atomic::accumulator::AccumulatorCaches;
+    type Network = crate::nnue::atomic::AtomicNetwork;
+    type Accumulators = crate::nnue::atomic::AtomicAccumulators;
+    type Caches = crate::nnue::atomic::AtomicCaches;
 
     #[inline(always)]
     fn eval_file(networks: &Networks) -> &EvalFile<Self::Network> {

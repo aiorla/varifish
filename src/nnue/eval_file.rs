@@ -13,7 +13,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::atomic::network::Network as AtomicNetwork;
+use super::atomic::AtomicNetwork;
 use super::network::Network as ChessNetwork;
 use crate::memory::LargePageBox;
 
@@ -21,8 +21,6 @@ use crate::memory::LargePageBox;
 pub trait NetworkFile: Send + Sync + Sized + 'static {
     /// The file loaded when EvalFile is empty or names it
     const DEFAULT_NAME: &'static str;
-    /// What the evaluation is called when verified
-    const KIND: &'static str;
 
     /// The network in the bytes of a network file, and the file's
     /// description, or None if the bytes are not a network of this kind.
@@ -31,11 +29,14 @@ pub trait NetworkFile: Send + Sync + Sized + 'static {
     /// The network's file, with the description given.
     fn write(&self, description: &[u8]) -> Vec<u8>;
 
+    /// What the evaluation is called when verified
+    fn kind(&self) -> &'static str;
+
     /// Where the default network can be downloaded
     fn download_url() -> String;
 
     /// The size in MiB and the dimensions, as verify reports them.
-    fn size_and_dimensions() -> String;
+    fn size_and_dimensions(&self) -> String;
 }
 
 /// A network, the name it was loaded by, and the description in its file.
@@ -175,14 +176,15 @@ impl<N: NetworkFile> EvalFile<N> {
         )
     }
 
-    /// The line describing the network loaded.
+    /// The line describing the network loaded, which is loaded.
     fn describe(&self) -> String {
+        let network = self.network().expect("a network is loaded");
         let current = self.current.as_deref().unwrap_or(Path::new(""));
         format!(
             "NNUE evaluation using {}{} {}",
-            N::KIND,
+            network.kind(),
             current.display(),
-            N::size_and_dimensions()
+            network.size_and_dimensions()
         )
     }
 }
@@ -296,8 +298,16 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let chess_file = directory.join("chess.nnue");
         let atomic_file = directory.join("atomic.nnue");
-        fs::write(&chess_file, ChessNetwork::zeroed().write(b"chess")).unwrap();
-        fs::write(&atomic_file, AtomicNetwork::zeroed().write(b"atomic")).unwrap();
+        fs::write(
+            &chess_file,
+            ChessNetwork::zeroed_with_stacks(1).write(b"chess"),
+        )
+        .unwrap();
+        fs::write(
+            &atomic_file,
+            crate::nnue::atomic::network::Network::zeroed().write(b"atomic"),
+        )
+        .unwrap();
 
         let mut networks = Networks::default();
         networks.load(&directory, Path::new("atomic.nnue"), &[]);

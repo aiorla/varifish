@@ -351,16 +351,20 @@ fn generate_all<const T: GenType>(pos: &Position, moves: &mut Moves) {
         target = !pos.pieces_c(us);
     }
 
-    target &= !pos.threats_by(ALL_PIECES);
-
     let b = pseudo_attacks(KING, ksq) & target;
-    splat_moves(moves, ksq, b);
+    if b.any() {
+        splat_moves(moves, ksq, b & !pos.threats_by(ALL_PIECES));
+    }
 
     if T == QUIETS && pos.can_castle(castling_rights_of(us, ANY_CASTLING)) {
         for cr in [
             castling_rights_of(us, KING_SIDE),
             castling_rights_of(us, QUEEN_SIDE),
         ] {
+            if !pos.can_castle(cr) || pos.castling_impeded(cr) {
+                continue;
+            }
+
             let rook_square = pos.castling_rook_square(cr);
             let to = (if rook_square > ksq {
                 Square::G1
@@ -369,9 +373,7 @@ fn generate_all<const T: GenType>(pos: &Position, moves: &mut Moves) {
             })
             .relative(us);
 
-            if !pos.castling_impeded(cr)
-                && pos.can_castle(cr)
-                && (between_bb(ksq, to) & pos.threats_by(ALL_PIECES)).is_empty()
+            if (between_bb(ksq, to) & pos.threats_by(ALL_PIECES)).is_empty()
                 && !pos.blockers_for_king(us).has(rook_square)
             {
                 moves.push(Move::make(CASTLING, ksq, rook_square, KNIGHT));

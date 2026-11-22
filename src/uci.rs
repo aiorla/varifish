@@ -191,7 +191,7 @@ impl UciEngine {
             "eval" => self.trace_eval()?,
             "export_net" => {
                 let file = is.token().map(PathBuf::from);
-                let message = self.engine.save_network(file.as_deref());
+                let message = self.apply_idle(|engine| engine.save_network(file.as_deref()));
                 self.send(&message);
             }
             "--help" | "help" | "--license" | "license" => self.send(HELP),
@@ -256,6 +256,13 @@ impl UciEngine {
 
             if is.fail() {
                 return Err(self.critical_error(&format!("Invalid argument for '{token}'")));
+            }
+        }
+
+        // Sanitize negative time values, zero for stm means no TM
+        for t in limits.time.iter_mut().chain([&mut limits.movetime]) {
+            if *t < 0 {
+                *t = 1;
             }
         }
 
@@ -357,8 +364,16 @@ impl UciEngine {
         Ok(())
     }
 
+    /// Applies a command that changes the engine once no search runs: a GUI
+    /// that sends one while the engine searches stops the search.
+    fn apply_idle<R>(&mut self, mutate: impl FnOnce(&mut Engine) -> R) -> R {
+        self.engine.stop();
+        self.engine.wait_for_search_finished();
+        mutate(&mut self.engine)
+    }
+
     fn setoption(&mut self, is: &mut IStream) {
-        match self.engine.setoption(is) {
+        match self.apply_idle(|engine| engine.setoption(is)) {
             Ok(Some(info)) => print_info_string(&self.out, &info),
             Ok(None) => {}
             Err(message) => self.send(&message),
@@ -446,9 +461,25 @@ fn read_line(input: &mut impl BufRead) -> Option<String> {
     }
 }
 
+/// The win rate model's polynomials p_a and p_b of the material over 58,
+/// highest power first: chess's are Stockfish's, fitted on fishtest's games.
+const WIN_RATE_CHESS: ([f64; 4], [f64; 4]) = (
+    [-142.72052667, 372.35176398, -340.71073572, 415.23490212],
+    [5.93832785, 15.61267078, -30.57816876, 69.63866711],
+);
+
+/// Atomic's, fitted by Stockfish's WDL_model on 17,922 of varifish's games
+/// with its default network, atomic-b0d279b9e021, at the long time control:
+/// the mover wins half of such games at 360 on a full board, at 395 at 58
+/// and at 552 at 17.
+const WIN_RATE_ATOMIC: ([f64; 4], [f64; 4]) = (
+    [-261.46420480, 803.95147110, -900.94914215, 753.53820466],
+    [-99.25575605, 238.19540550, -150.67070761, 115.23634613],
+);
+
 /// The parameters a and b of the win rate model for the material on the
 /// board.
-fn win_rate_params(pos: &Position<impl Variant>) -> (f64, f64) {
+fn win_rate_params<V: Variant>(pos: &Position<V>) -> (f64, f64) {
     let material = pos.count_both(PAWN)
         + 3 * pos.count_both(KNIGHT)
         + 3 * pos.count_both(BISHOP)
@@ -461,17 +492,20 @@ fn win_rate_params(pos: &Position<impl Variant>) -> (f64, f64) {
 
     // Return a = p_a(material) and b = p_b(material), see
     // github.com/official-stockfish/WDL_model
-    const AS: [f64; 4] = [-142.72052667, 372.35176398, -340.71073572, 415.23490212];
-    const BS: [f64; 4] = [5.93832785, 15.61267078, -30.57816876, 69.63866711];
+    let (a, b) = if V::ATOMIC {
+        WIN_RATE_ATOMIC
+    } else {
+        WIN_RATE_CHESS
+    };
 
     let p = |c: [f64; 4]| mul_add(mul_add(mul_add(c[0], m, c[1]), m, c[2]), m, c[3]);
 
-    (p(AS), p(BS))
+    (p(a), p(b))
 }
 
 /// The win rate model is 1 / (1 + exp((a - eval) / b)), where a =
 /// p_a(material) and b = p_b(material). It fits the LTC fishtest statistics
-/// rather accurately.
+/// rather accurately, and Atomic's those of our own tests.
 fn win_rate_model(v: Value, pos: &Position<impl Variant>) -> i32 {
     let (a, b) = win_rate_params(pos);
 
@@ -499,11 +533,6 @@ pub fn format_score(s: &Score) -> String {
 /// Turns a Value to an integer centipawn number, without treatment of mate
 /// and similar special scores.
 pub fn to_cp<V: Variant>(v: Value, pos: &Position<V>) -> i32 {
-    if V::ATOMIC {
-        // Atomic-Stockfish's pawn, Fairy-Stockfish's fixed normalization
-        return (100 * i64::from(v) / i64::from(PAWN_VALUE)) as i32;
-    }
-
     // In general, the score can be defined via the WDL as
     // (log(1/L - 1) - log(1/W - 1)) / (log(1/L - 1) + log(1/W - 1)).
     // Based on our win_rate_model, this simply yields v / a.
@@ -513,17 +542,13 @@ pub fn to_cp<V: Variant>(v: Value, pos: &Position<V>) -> i32 {
     (f64::from(100 * v) / a).round() as i32
 }
 
-/// The win, draw and loss chances of a value, in per mille, by the win rate
-/// model of chess. Other variants have none.
-pub fn wdl<V: Variant>(v: Value, pos: &Position<V>) -> Option<String> {
-    if V::ATOMIC {
-        return None;
-    }
-
+/// The win, draw and loss chances of a value, in per mille, by the variant's
+/// win rate model.
+pub fn wdl<V: Variant>(v: Value, pos: &Position<V>) -> String {
     let wdl_w = win_rate_model(v, pos);
     let wdl_l = win_rate_model(-v, pos);
     let wdl_d = 1000 - wdl_w - wdl_l;
-    Some(format!("{wdl_w} {wdl_d} {wdl_l}"))
+    format!("{wdl_w} {wdl_d} {wdl_l}")
 }
 
 /// A move in UCI notation, where castling is the king's move to its square,
@@ -626,7 +651,9 @@ fn on_bestmove(out: &Output, bestmove: &str, ponder: &str) {
 mod tests {
     use super::*;
     use crate::engine::{MAX_HASH_MB, available_processors};
-    use crate::nnue::atomic::network::Network as AtomicNetwork;
+    use crate::nnue::architecture::RAW_LAYER_STACKS;
+    use crate::nnue::atomic::AtomicNetwork;
+    use crate::nnue::atomic::network::Network as LegacyAtomicNetwork;
     use crate::nnue::eval_file::{EvalFile, Networks};
     use crate::nnue::network::Network as ChessNetwork;
 
@@ -651,17 +678,27 @@ mod tests {
 
     /// An engine with networks of zeros, and its output and error output.
     fn engine_with_network() -> (UciEngine, Buffer, Buffer) {
+        engine_with_atomic_network(AtomicNetwork::Legacy(LegacyAtomicNetwork::zeroed()))
+    }
+
+    /// An engine with chess's network of zeros, which stores every layer
+    /// stack, and the Atomic network given.
+    fn engine_with_atomic_network(atomic: AtomicNetwork) -> (UciEngine, Buffer, Buffer) {
         let (mut engine, out, err) = engine();
         engine.engine.set_networks(Networks {
-            chess: EvalFile::with_network(ChessNetwork::zeroed()),
-            atomic: EvalFile::with_network(AtomicNetwork::zeroed()),
+            chess: EvalFile::with_network(ChessNetwork::zeroed_with_stacks(RAW_LAYER_STACKS)),
+            atomic: EvalFile::with_network(atomic.boxed()),
         });
         (engine, out, err)
     }
 
     /// The exit code and the output of an engine with a network of zeros.
     fn run(input: &str) -> (i32, String) {
-        let (mut engine, out, _) = engine_with_network();
+        run_with(engine_with_network(), input)
+    }
+
+    /// The exit code and the output of an engine.
+    fn run_with((mut engine, out, _): (UciEngine, Buffer, Buffer), input: &str) -> (i32, String) {
         let code = engine.run(&[], input.as_bytes());
         drop(engine);
         (code, text(&out))
@@ -669,7 +706,12 @@ mod tests {
 
     /// The output of commands run one at a time, each search to its end.
     fn search(commands: &[&str]) -> String {
-        let (mut engine, out, _) = engine_with_network();
+        search_with(engine_with_network(), commands)
+    }
+
+    /// The output of commands run one at a time by an engine, each search to
+    /// its end.
+    fn search_with((mut engine, out, _): (UciEngine, Buffer, Buffer), commands: &[&str]) -> String {
         for cmd in commands {
             assert!(matches!(engine.execute(cmd), Ok(true)), "{cmd}");
             engine.engine.wait_for_search_finished();
@@ -687,8 +729,8 @@ mod tests {
         )
     }
 
-    const NETWORK_INFO: &str = "info string NNUE evaluation using nn-c9e480e92425.nnue \
-                                (107MiB, (109424, 1024, 32, 32, 1))\n\
+    const NETWORK_INFO: &str = "info string NNUE evaluation using nn-bddd9d57eb87.nnue \
+                                (135MiB, (131952, 1024, 32, 32, 1))\n\
                                 info string Network replica 1: Local memory.\n";
 
     #[test]
@@ -719,7 +761,7 @@ mod tests {
                  option name Syzygy50MoveRule type check default true\n\
                  option name SyzygyProbeLimit type spin default 7 min 0 max 7\n\
                  option name Use NNUE type combo default true var true var pure\n\
-                 option name EvalFile type string default nn-c9e480e92425.nnue\nuciok\n\
+                 option name EvalFile type string default nn-bddd9d57eb87.nnue\nuciok\n\
                  readyok\n"
             )
         );
@@ -811,12 +853,12 @@ mod tests {
                 "readyok\n{}\
                  info string ERROR: Network evaluation parameters compatible with the engine \
                  must be available.\n\
-                 info string ERROR: The network file nn-c9e480e92425.nnue was not loaded \
+                 info string ERROR: The network file nn-bddd9d57eb87.nnue was not loaded \
                  successfully.\n\
                  info string ERROR: The UCI option EvalFile might need to specify the full \
                  path, including the directory name, to the network file.\n\
                  info string ERROR: The default net can be downloaded from: \
-                 https://tests.stockfishchess.org/api/nn/nn-c9e480e92425.nnue\n\
+                 https://tests.stockfishchess.org/api/nn/nn-bddd9d57eb87.nnue\n\
                  info string ERROR: The engine will be terminated now.\n",
                 go_info(1)
             )
@@ -845,9 +887,11 @@ mod tests {
     fn eval_traces_the_evaluation() {
         let (code, out) = run("eval\n");
         assert_eq!(code, 0);
-        let buckets: String = (0..32)
+        // The start's stack: 32 pieces, both queens, pawns on both halves
+        // and officers.
+        let buckets: String = (0..RAW_LAYER_STACKS)
             .map(|b| {
-                let used = if b == 31 {
+                let used = if b == ((7 * 4 + 3) * 3) * 2 + 1 {
                     " <-- this bucket is used"
                 } else {
                     ""
@@ -1033,7 +1077,7 @@ mod tests {
     const ATOMIC: &str = "setoption name UCI_Variant value atomic\n";
 
     const ATOMIC_NETWORK_INFO: &str = "info string NNUE evaluation using Legacy Atomic V1 \
-                                       atomic_run3b_e202_l05.nnue (45MiB, (45056, 1024, 16, 32, 1))\n\
+                                       atomic-b0d279b9e021.nnue (45MiB, (45056, 1024, 16, 32, 1))\n\
                                        info string Network replica 1: Local memory.\n";
 
     #[test]
@@ -1064,13 +1108,12 @@ mod tests {
                 "{}\
                  info string ERROR: Network evaluation parameters compatible with the engine \
                  must be available.\n\
-                 info string ERROR: The network file atomic_run3b_e202_l05.nnue was not loaded \
+                 info string ERROR: The network file atomic-b0d279b9e021.nnue was not loaded \
                  successfully.\n\
                  info string ERROR: The UCI option EvalFile might need to specify the full \
                  path, including the directory name, to the network file.\n\
                  info string ERROR: The default net can be downloaded from: \
-                 https://github.com/Belzedar94/Atomic-Stockfish/releases/download/v1.0/atomic-run3b.nnue\n\
-                 info string ERROR: Save it as atomic_run3b_e202_l05.nnue next to the engine.\n\
+                 https://github.com/aiorla/varifish/releases/download/networks/atomic-b0d279b9e021.nnue\n\
                  info string ERROR: The engine will be terminated now.\n",
                 go_info(1)
             )
@@ -1143,13 +1186,18 @@ mod tests {
             ["info depth 0 score mate 0", "bestmove (none)"]
         );
 
-        // Atomic scores are in Atomic-Stockfish's pawns, and without WDL.
+        // Atomic's scores go by its own win rate model, with its WDL.
         let out = search(&[
             ATOMIC.trim(),
             "setoption name UCI_ShowWDL value true",
             "go depth 3",
         ]);
-        assert!(!out.contains(" wdl "), "{out}");
+        assert!(
+            output_lines(&out)
+                .iter()
+                .any(|line| line.starts_with("info depth 3 ") && line.contains(" wdl ")),
+            "{out}"
+        );
     }
 
     #[test]
@@ -1175,6 +1223,69 @@ mod tests {
                 assert!(last.ends_with(&format!(" pv {m} {explosion}")), "{out}");
             }
         }
+    }
+
+    /// An engine whose Atomic network is one of zeros in Stockfish's design.
+    /// It stores 4 layer stacks, the others falling back to the first.
+    fn engine_with_sfnnv20_network() -> (UciEngine, Buffer, Buffer) {
+        engine_with_atomic_network(AtomicNetwork::Sfnnv20(
+            crate::nnue::atomic::sfnnv20::Network::zeroed(4),
+        ))
+    }
+
+    #[test]
+    fn atomic_evaluates_with_a_network_in_stockfish_design() {
+        let (code, out) = run_with(engine_with_sfnnv20_network(), &format!("{ATOMIC}eval\n"));
+        assert_eq!(code, 0);
+        // All 32 pieces and both queens: a raw stack the file does not
+        // store, which falls back to the first.
+        let buckets: String = (0..4)
+            .map(|b| {
+                let used = if b == 0 {
+                    " <-- this bucket is used"
+                } else {
+                    ""
+                };
+                format!("|  {b:<10}|     0.00   |{used}\n")
+            })
+            .collect();
+        assert_eq!(
+            out,
+            format!(
+                "info string NNUE evaluation using Atomic FullThreats+PP_3Wide+K32H3 SFNNv20 \
+                 atomic-b0d279b9e021.nnue (128MiB, (131952, 1024, 32, 32, 1))\n\
+                 info string Network replica 1: Local memory.\n\n\n\
+                 NNUE network contributions (Normalized, White to move)\n\
+                 +------------+------------+\n\
+                 |   Bucket   | Evaluation |\n\
+                 +------------+------------+\n\
+                 {buckets}\
+                 +------------+------------+\n\n\
+                 NNUE evaluation          +0 (side to move, internal units)\n\
+                 NNUE evaluation        +0.00 (white side)\n\
+                 Final evaluation      +0.00 (white side) [Use NNUE=true]\n\n"
+            )
+        );
+
+        // Searches update its accumulators through the explosions: the
+        // queen explodes the king by taking the pawn next to it, and a
+        // longer search plays on.
+        let fen = "k7/1p6/8/8/8/8/8/4K2Q w - - 0 1";
+        let out = search_with(
+            engine_with_sfnnv20_network(),
+            &[ATOMIC.trim(), &format!("position fen {fen}"), "go depth 3"],
+        );
+        let lines = output_lines(&out);
+        assert!(lines[2].contains(" score mate 1 "), "{out}");
+        assert_eq!(*lines.last().unwrap(), "bestmove h1b7", "{out}");
+        let out = search_with(
+            engine_with_sfnnv20_network(),
+            &[ATOMIC.trim(), "position startpos", "go depth 8"],
+        );
+        assert!(
+            output_lines(&out).last().unwrap().starts_with("bestmove "),
+            "{out}"
+        );
     }
 
     #[test]
@@ -1205,10 +1316,10 @@ mod tests {
         assert!(matches!(engine.execute("bench 16 1 2"), Ok(true)));
         let err = text(&err);
         assert!(
-            err.contains("\nPosition: 13/13 (1R4kr/4K3/8/8/8/8/8/8 b h - 0 1)\n"),
+            err.contains("\nPosition: 19/19 (6k1/p7/6p1/3n3p/3P4/P7/1P3r2/7K w - - 0 1)\n"),
             "{err}"
         );
-        assert_eq!(text(&out).matches("bestmove").count(), 13);
+        assert_eq!(text(&out).matches("bestmove").count(), 19);
     }
 
     #[test]
@@ -1237,9 +1348,41 @@ mod tests {
     #[test]
     fn wdl_splits_a_thousand() {
         let pos = Position::<Chess>::new();
-        assert_eq!(wdl(0, &pos).unwrap(), "18 964 18");
-        assert_eq!(wdl(-300, &pos).unwrap(), "0 442 558");
-        assert_eq!(wdl(VALUE_MATE, &pos).unwrap(), "1000 0 0");
-        assert_eq!(wdl(0, &Position::<Atomic>::new()), None);
+        assert_eq!(wdl(0, &pos), "18 964 18");
+        assert_eq!(wdl(-300, &pos), "0 442 558");
+        assert_eq!(wdl(VALUE_MATE, &pos), "1000 0 0");
+
+        // Atomic's model: on a full board the mover wins half its games at
+        // 360, which prints as a pawn, where Atomic-Stockfish's pawn is 208.
+        let pos = Position::<Atomic>::new();
+        assert_eq!(wdl(0, &pos), "28 944 28");
+        assert_eq!(wdl(-300, &pos), "2 641 357");
+        assert_eq!(wdl(360, &pos), "500 499 1");
+        assert_eq!(wdl(VALUE_MATE, &pos), "1000 0 0");
+        assert_eq!(to_cp(360, &pos), 100);
+        assert_eq!(to_cp(-360, &pos), -100);
+        assert_eq!(to_cp(PAWN_VALUE, &pos), 58);
+    }
+
+    #[test]
+    fn atomic_s_pawn_is_worth_more_with_less_material() {
+        // The score of an even chance to win rises as the material falls,
+        // and stays as it is at 17 below it.
+        let pawns = |fen: &str| {
+            let mut pos = Position::<Atomic>::new();
+            pos.set(fen, false).unwrap();
+            to_cp(1000, &pos)
+        };
+        // 78, then 58 (no queens, a pawn each less), 17 and 8
+        assert_eq!(
+            pawns("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+            278
+        );
+        assert_eq!(
+            pawns("rnb1kbnr/ppppppp1/8/8/8/8/PPPPPPP1/RNB1KBNR w KQkq - 0 1"),
+            253
+        );
+        assert_eq!(pawns("4k2r/ppppp3/8/8/8/8/PPPP4/4K1N1 w - - 0 1"), 181);
+        assert_eq!(pawns("4k3/pppp4/8/8/8/8/PPPP4/4K3 w - - 0 1"), 181);
     }
 }

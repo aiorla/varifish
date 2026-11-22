@@ -14,7 +14,9 @@
 //!
 //! The walks are chess's, with the default network from nets/, where `make
 //! net` downloads it, unless EVALFILE names a network, of chess or of
-//! Atomic, whose variant they then walk.
+//! Atomic, whose variant they then walk. Atomic's walks take the network's
+//! output alone (`Use NNUE` pure), as Atomic-Stockfish's walk does, since
+//! varifish scales it by the material with its own tuned constants.
 
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
@@ -24,8 +26,8 @@ use std::time::Instant;
 use varifish::evaluate::EVAL_FILE_DEFAULT_NAME;
 use varifish::misc::Prng;
 use varifish::movegen::{ALL, MoveList};
-use varifish::nnue::atomic::network::Network as AtomicNetwork;
-use varifish::nnue::eval_file::UseNnue;
+use varifish::nnue::atomic::AtomicNetwork;
+use varifish::nnue::eval_file::{NetworkFile, UseNnue};
 use varifish::nnue::network::Network as ChessNetwork;
 use varifish::nnue::{Accumulators, Caches};
 use varifish::position::Position;
@@ -91,7 +93,7 @@ fn walk<V: Variant>(network: &V::Network, plies: usize, seed: u64) -> Result<(),
 
         let mut pos =
             Position::<V>::from_fen(&line[2..], line.starts_with('1')).map_err(|e| e.0)?;
-        accumulators.reset();
+        accumulators.reset(Some(network));
 
         let mut evaluate = |pos: &Position<V>, accumulators: &mut V::Accumulators| {
             let value = V::evaluate(
@@ -100,7 +102,11 @@ fn walk<V: Variant>(network: &V::Network, plies: usize, seed: u64) -> Result<(),
                 accumulators,
                 &mut caches,
                 0,
-                UseNnue::True,
+                if V::ATOMIC {
+                    UseNnue::Pure
+                } else {
+                    UseNnue::True
+                },
             );
             hash = hash.wrapping_mul(1000003).wrapping_add(value as u64);
             evaluations += 1;
@@ -130,7 +136,7 @@ fn walk<V: Variant>(network: &V::Network, plies: usize, seed: u64) -> Result<(),
 
             for &m in moves {
                 let gives_check = pos.gives_check(m);
-                pos.do_move(m, gives_check, accumulators.push());
+                pos.do_move(m, gives_check, accumulators.push(&pos));
                 if evaluable(&pos) {
                     evaluate(&pos, &mut accumulators);
                 }
@@ -140,7 +146,7 @@ fn walk<V: Variant>(network: &V::Network, plies: usize, seed: u64) -> Result<(),
 
             let m = moves[(rng.rand64() % moves.len() as u64) as usize];
             let gives_check = pos.gives_check(m);
-            pos.do_move(m, gives_check, accumulators.push());
+            pos.do_move(m, gives_check, accumulators.push(&pos));
         }
 
         seconds += start.elapsed().as_secs_f64();

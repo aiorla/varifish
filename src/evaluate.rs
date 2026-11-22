@@ -21,7 +21,7 @@ use crate::uci::to_cp;
 // The default net name MUST follow the format nn-[SHA256 first 12 digits].nnue
 // for the build process to work: build.rs and the Makefile read it from this
 // line, which must stay as it is.
-pub const EVAL_FILE_DEFAULT_NAME: &str = "nn-c9e480e92425.nnue";
+pub const EVAL_FILE_DEFAULT_NAME: &str = "nn-bddd9d57eb87.nnue";
 
 fn simple_eval(pos: &Position) -> i32 {
     let c = pos.side_to_move();
@@ -59,7 +59,7 @@ fn scale_evaluation(nnue: Value, optimism: i32, pos: &Position) -> Value {
     let correl = (se_norm * nnue_norm) / 512;
 
     // When winning, we boost easy positions, and vice versa
-    let mut v = nnue + (nnue * correl) / 65536 + (optimism * correl) / 16384;
+    let mut v = nnue + (nnue + optimism) * correl / 65536;
 
     // Scale the combined evaluation by total material
     let material = 521 * pos.count_both(PAWN) + pos.non_pawn_material_total();

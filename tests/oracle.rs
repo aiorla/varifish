@@ -168,6 +168,7 @@ fn check_position(pos: &mut Position, sk: &Chess, chess960: bool) {
         "{fen}"
     );
     assert_eq!(st.check_squares, new.check_squares, "{fen}");
+    assert_eq!(st.piece_placement, new.piece_placement, "{fen}");
     let threats_by = |pos: &Position| {
         [ALL_PIECES, PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING].map(|pt| pos.threats_by(pt))
     };
@@ -269,6 +270,11 @@ fn check_position(pos: &mut Position, sk: &Chess, chess960: bool) {
         pos.do_null_move();
         let fresh = Position::from_fen(&pos.fen(), chess960).unwrap();
         assert_eq!(pos.state().key, fresh.state().key, "{fen}");
+        assert_eq!(
+            pos.state().piece_placement,
+            fresh.state().piece_placement,
+            "{fen}"
+        );
         pos.undo_null_move();
         assert_eq!((pos.fen(), pos.state().clone()), (fen.clone(), state));
     }

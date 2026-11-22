@@ -34,14 +34,21 @@ else ifeq ($(ARCH),x86-64)
 	RUSTFLAGS_ARCH = -C target-cpu=x86-64
 else ifeq ($(ARCH),x86-64-sse41-popcnt)
 	RUSTFLAGS_ARCH = $(X86_64_GENERIC)$(X86_64_V2)
-else ifneq ($(filter $(ARCH),x86-64-avx2 x86-64-bmi2),)
+else ifeq ($(ARCH),x86-64-avx2)
 	RUSTFLAGS_ARCH = $(X86_64_GENERIC)$(X86_64_V3)
+	PEXT = no
+else ifeq ($(ARCH),x86-64-bmi2)
+	RUSTFLAGS_ARCH = $(X86_64_GENERIC)$(X86_64_V3)
+	PEXT = yes
 else ifeq ($(ARCH),x86-64-avx512)
 	RUSTFLAGS_ARCH = $(X86_64_GENERIC)$(X86_64_V4)
+	PEXT = yes
 else ifeq ($(ARCH),x86-64-vnni512)
 	RUSTFLAGS_ARCH = $(X86_64_GENERIC)$(X86_64_V4),+avx512vnni
+	PEXT = yes
 else ifeq ($(ARCH),x86-64-avx512icl)
 	RUSTFLAGS_ARCH = $(X86_64_GENERIC)$(X86_64_ICL)
+	PEXT = yes
 else ifeq ($(ARCH),apple-silicon)
 	RUSTFLAGS_ARCH = -C target-cpu=apple-m1
 else ifeq ($(ARCH),armv8)
@@ -86,7 +93,7 @@ endif
 # runner without AVX-512 lacks those of x86-64-avx512.
 TARGET_DIR = target/$(ARCH)
 BUILD_TARGET = $(or $(TARGET),$(shell $(CARGO) -vV | sed -n 's/^host: //p'))
-CARGO_BUILD = RUSTFLAGS="$(RUSTFLAGS_ARCH)" $(CARGO) build --release --locked --target-dir $(TARGET_DIR) --target $(BUILD_TARGET)
+CARGO_BUILD = VARIFISH_PEXT="$(PEXT)" RUSTFLAGS="$(RUSTFLAGS_ARCH)" $(CARGO) build --release --locked --target-dir $(TARGET_DIR) --target $(BUILD_TARGET)
 RELEASE_DIR = $(TARGET_DIR)/$(BUILD_TARGET)/release
 ifdef FEATURES
 	CARGO_BUILD += --features $(FEATURES)
@@ -150,12 +157,12 @@ tablebases:
 	$(CARGO_BUILD) --example tablebases
 	cp $(RELEASE_DIR)/examples/tablebases$(EXE_SUFFIX) tablebases$(EXE_SUFFIX)
 
-# Atomic's network, which Atomic-Stockfish's v1.0 release has, checked
-# against its SHA-256: Atomic's builds embed none, and `make bolt` profiles
-# Atomic's bench on it.
-ATOMIC_NET = atomic_run3b_e202_l05.nnue
-ATOMIC_NET_SHA256 = 99dc67eabf26a64faeeca3a88b4c38597a840b8d4a874b9f2cf658c6f92a04a6
-ATOMIC_NET_URL = https://github.com/Belzedar94/Atomic-Stockfish/releases/download/v1.0/atomic-run3b.nnue
+# Atomic's network, the one src/nnue/atomic.rs names, which
+# varifish's `networks` release has, checked against its SHA-256: Atomic's
+# builds embed none, and `make bolt` profiles Atomic's bench on it.
+ATOMIC_NET = atomic-b0d279b9e021.nnue
+ATOMIC_NET_SHA256 = b0d279b9e02158c73f0eca6f24603c11789e3e029e39715d351a54193920a638
+ATOMIC_NET_URL = https://github.com/aiorla/varifish/releases/download/networks/$(ATOMIC_NET)
 
 atomic-net: nets/$(ATOMIC_NET)
 

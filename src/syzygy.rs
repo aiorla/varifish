@@ -2066,9 +2066,8 @@ fn set_sizes(d: &mut PairsData, bytes: &[u8], mut data: usize, end: usize) -> Op
     let symlen_size = usize::from(u16_le(bytes, data));
     data += 2;
 
-    // Symbols are 12 bits long: more of them make a corrupt table, which
-    // Stockfish would read past its buffers.
-    if !fits(data, symlen_size as u64, 3, end) || symlen_size > SYM_COUNT {
+    // Symbols are 12 bits long: more of them make a corrupt table.
+    if symlen_size > SYM_COUNT || !fits(data, symlen_size as u64, 3, end) {
         return None;
     }
 

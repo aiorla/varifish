@@ -688,14 +688,55 @@ impl Blast {
     }
 }
 
+/// The threats an Atomic move changes. A capture removes the capturing
+/// piece, the captured one and at most 8 more, each changing at most 8 + 16
+/// threats and revealing at most 8, as `DirtyThreats` counts for chess: 320,
+/// and AVX-512 stores write 16 beyond the last. The list holds the next power
+/// of two.
+pub const MAX_ATOMIC_DIRTY_THREATS: usize = 512;
+pub type AtomicDirtyThreats = ValueList<DirtyThreat, MAX_ATOMIC_DIRTY_THREATS>;
+
+/// The list an Atomic move records the threats it changes in, when the
+/// network searched with has threat features: one that the accumulator
+/// state pushed for the move holds beside its `AtomicDirties`, or none.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ThreatRecord(Option<std::ptr::NonNull<AtomicDirtyThreats>>);
+
+// SAFETY: the list lies in the same accumulator state as the record, which
+// the thread whose stack holds both moves with them.
+unsafe impl Send for ThreatRecord {}
+
+impl ThreatRecord {
+    /// A record into `list`, which the move that this record goes to may
+    /// fill, through `list()`, while nothing else refers to the list.
+    #[inline(always)]
+    pub fn new(list: &mut AtomicDirtyThreats) -> ThreatRecord {
+        ThreatRecord(Some(std::ptr::NonNull::from(list)))
+    }
+
+    /// The list to record in, if any.
+    ///
+    /// # Safety
+    ///
+    /// The list is alive and nothing else refers to it while the reference
+    /// returned is used: the stack that pushed the record's state is not
+    /// touched before the move has been recorded.
+    #[inline(always)]
+    pub unsafe fn list<'a>(self) -> Option<&'a mut AtomicDirtyThreats> {
+        // SAFETY: as the caller ensures.
+        self.0.map(|mut list| unsafe { list.as_mut() })
+    }
+}
+
 /// Everything an Atomic move changes that the network follows: the move as
 /// `DirtyPiece` records a chess move, but where a capture explodes the
-/// capturing piece `to` is `Square::NONE` and nothing is added, and the other
-/// pieces the capture explodes.
+/// capturing piece `to` is `Square::NONE` and nothing is added, the other
+/// pieces the capture explodes, and where to record the threats it changes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct AtomicDirties {
     pub dirty_piece: DirtyPiece,
     pub blast: Blast,
+    pub threats: ThreatRecord,
 }
 
 impl MoveDirties for AtomicDirties {

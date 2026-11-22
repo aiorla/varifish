@@ -123,6 +123,11 @@ mod platform {
     pub fn vec_maddubs_16(a: VecT, b: VecT) -> VecT {
         unsafe { _mm512_maddubs_epi16(a, b) }
     }
+
+    #[inline(always)]
+    pub fn vec_xor(a: VecT, b: VecT) -> VecT {
+        unsafe { _mm512_xor_si512(a, b) }
+    }
 }
 
 #[cfg(all(use_avx2, not(use_avx512)))]
@@ -212,6 +217,11 @@ mod platform {
     #[inline(always)]
     pub fn vec_maddubs_16(a: VecT, b: VecT) -> VecT {
         unsafe { _mm256_maddubs_epi16(a, b) }
+    }
+
+    #[inline(always)]
+    pub fn vec_xor(a: VecT, b: VecT) -> VecT {
+        unsafe { _mm256_xor_si256(a, b) }
     }
 
     /// The i32 lanes greater than zero, a bit each.
@@ -330,6 +340,12 @@ mod platform {
     #[inline(always)]
     pub fn vec_maddubs_16(a: VecT, b: VecT) -> VecT {
         unsafe { _mm_maddubs_epi16(a, b) }
+    }
+
+    #[cfg(use_ssse3)]
+    #[inline(always)]
+    pub fn vec_xor(a: VecT, b: VecT) -> VecT {
+        unsafe { _mm_xor_si128(a, b) }
     }
 
     /// The i32 lanes greater than zero, a bit each.

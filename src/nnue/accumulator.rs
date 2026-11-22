@@ -21,9 +21,10 @@ use std::arch::x86_64::*;
 
 use super::architecture::L1;
 use super::feature_transformer::{
-    FeatureTransformer, OUTPUT_DIMENSIONS, PSQ_DIMENSIONS, THREAT_AND_PP_DIMENSIONS,
+    FeatureTransformer, OUTPUT_DIMENSIONS, PSQ_BLOCK_DIMENSIONS, THREAT_AND_PP_DIMENSIONS,
 };
-use super::features::{full_threats, k32q2, pp_3wide};
+use super::features::k32h3::{self, K32H3};
+use super::features::{full_threats, pp_3wide};
 use super::network::Network;
 #[cfg(not(any(use_neon, use_paired_widening_add)))]
 use super::simd::vec_load_convert_8_16;
@@ -32,29 +33,29 @@ use super::simd::{
 };
 #[cfg(use_paired_widening_add)]
 use super::simd::{
-    vec_maddubs_16, vec_set_8, vec_srai_16, vec_unpackhi_8, vec_unpacklo_8, vec_zero,
+    vec_maddubs_16, vec_set_8, vec_set_16, vec_srai_16, vec_unpackhi_8, vec_unpacklo_8, vec_xor,
+    vec_zero,
 };
 use crate::bitboard::{Bitboard, square_bb};
 use crate::memory::LargePageBox;
-#[cfg(use_paired_widening_add)]
-use crate::misc::ValueList;
 use crate::position::Position;
 use crate::types::*;
 
-type PsqIndexList = k32q2::IndexList;
+type PsqIndexList = k32h3::IndexList;
 /// Threat and pawn pair indices, which share the threat weights' rows.
 type ThreatIndexList = full_threats::IndexList;
 
-const DIMENSIONS: usize = OUTPUT_DIMENSIONS;
+pub(super) const DIMENSIONS: usize = OUTPUT_DIMENSIONS;
 
 /// The result of the affine transformation of a position's input features
-/// for both perspectives, which of them are up to date, and what the move
-/// to the position changed.
+/// for both perspectives, which of them are up to date, what the move to the
+/// position changed, and the state of the piece-square blocks before it.
 #[repr(C, align(64))]
 pub struct AccumulatorState {
     pub accumulation: [[i16; L1]; COLOR_NB],
     pub computed: [bool; COLOR_NB],
     pub dirties: Dirties,
+    pub block_before: k32h3::BlockState,
 }
 
 /// AccumulatorCaches provides per-thread accumulator caches, where each
@@ -64,9 +65,9 @@ pub struct AccumulatorState {
 /// scratch. This idea was first described by Luecx (author of Koivisto) and
 /// is commonly referred to as "Finny Tables".
 pub struct AccumulatorCaches {
-    /// The entries by whether the perspective's opponent has a queen, then
-    /// by king square
-    entries: [[[Entry; COLOR_NB]; SQUARE_NB]; 2],
+    /// The entries by the perspective's piece-square block, then by king
+    /// square
+    entries: [[[Entry; COLOR_NB]; SQUARE_NB]; K32H3::NUM_BLOCKS],
 }
 
 #[repr(C, align(64))]
@@ -145,13 +146,14 @@ impl AccumulatorStack {
         self.size = 1;
     }
 
-    /// Adds the state of the position after a move, whose changes the move
-    /// records in the dirties returned.
+    /// Adds the state of the position after a move from `pos`, whose
+    /// changes the move records in the dirties returned.
     #[inline(always)]
-    pub fn push(&mut self) -> &mut Dirties {
+    pub fn push(&mut self, pos: &Position) -> &mut Dirties {
         debug_assert!(self.size < Self::MAX_SIZE);
         let st = &mut self.accumulators[self.size];
         st.computed = [false; COLOR_NB];
+        st.block_before = k32h3::block_state(pos);
         st.dirties.dirty_threats.clear();
         self.size += 1;
         &mut st.dirties
@@ -170,8 +172,8 @@ impl AccumulatorStack {
         feature_transformer: &FeatureTransformer,
         cache: &mut AccumulatorCaches,
     ) {
-        let last_white = self.find_last_usable_accumulator(WHITE);
-        let last_black = self.find_last_usable_accumulator(BLACK);
+        let last_white = self.find_last_usable_accumulator(WHITE, pos);
+        let last_black = self.find_last_usable_accumulator(BLACK, pos);
 
         if self.accumulators[last_white].computed[WHITE.idx()]
             && self.accumulators[last_black].computed[BLACK.idx()]
@@ -206,7 +208,8 @@ impl AccumulatorStack {
             // The root's dirty piece is none, so a king move has a state
             // before it.
             if dirty_piece.pc == make_piece(perspective, KING)
-                && dirty_piece.remove_pc != make_piece(!perspective, QUEEN)
+                && usize::from(self.latest().block_before[perspective.idx()])
+                    == k32h3::block_of(pos, perspective)
                 && self.size >= 2
                 && self.accumulators[self.size - 2].computed[perspective.idx()]
                 && pos.count_both(ALL_PIECES) >= MIN_PC_COUNT_HYBRID
@@ -244,18 +247,23 @@ impl AccumulatorStack {
     }
 
     /// Find the earliest usable accumulator, this can either be a computed
-    /// accumulator or the accumulator state just before a change that
+    /// accumulator or the accumulator state just after a change that
     /// requires full refresh.
-    fn find_last_usable_accumulator(&self, perspective: Color) -> usize {
+    fn find_last_usable_accumulator(&self, perspective: Color, pos: &Position) -> usize {
+        // All traversed states must use the current block.
+        let psq_block = k32h3::block_of(pos, perspective);
+
         for curr_idx in (1..self.size).rev() {
             let state = &self.accumulators[curr_idx];
             if state.computed[perspective.idx()] {
                 return curr_idx;
             }
 
+            let before = usize::from(state.block_before[perspective.idx()]);
+
             // Threat feature set refreshes require a king move across the
             // center, i.e., a subset of halfka refreshes
-            if k32q2::requires_refresh(&state.dirties.dirty_piece, perspective) {
+            if k32h3::requires_refresh(&state.dirties.dirty_piece, perspective, before, psq_block) {
                 return curr_idx;
             }
         }
@@ -274,7 +282,7 @@ impl AccumulatorStack {
         debug_assert!(self.accumulators[begin].computed[perspective.idx()]);
 
         let ksq = pos.king_square(perspective);
-        let opponent_has_queen = pos.pieces_cpt(!perspective, QUEEN).any();
+        let psq_block = k32h3::block_of(pos, perspective);
 
         for next in begin + 1..self.size {
             let (target, computed) = target_and_source(&mut self.accumulators, next, next - 1);
@@ -282,7 +290,7 @@ impl AccumulatorStack {
                 perspective,
                 feature_transformer,
                 ksq,
-                opponent_has_queen,
+                psq_block,
                 target,
                 computed,
             );
@@ -302,7 +310,7 @@ impl AccumulatorStack {
         debug_assert!(self.latest().computed[perspective.idx()]);
 
         let ksq = pos.king_square(perspective);
-        let opponent_has_queen = pos.pieces_cpt(!perspective, QUEEN).any();
+        let psq_block = k32h3::block_of(pos, perspective);
 
         for next in (end..self.size - 1).rev() {
             let (target, computed) = target_and_source(&mut self.accumulators, next, next + 1);
@@ -310,7 +318,7 @@ impl AccumulatorStack {
                 perspective,
                 feature_transformer,
                 ksq,
-                opponent_has_queen,
+                psq_block,
                 target,
                 computed,
             );
@@ -333,8 +341,8 @@ impl AccumulatorStack {
 
         let white_ksq = pos.king_square(WHITE);
         let black_ksq = pos.king_square(BLACK);
-        let white_opp_queen = pos.pieces_cpt(BLACK, QUEEN).any();
-        let black_opp_queen = pos.pieces_cpt(WHITE, QUEEN).any();
+        let white_block = k32h3::block_of(pos, WHITE);
+        let black_block = k32h3::block_of(pos, BLACK);
         let shared_begin = white_begin.max(black_begin);
 
         // Catch up the lagging perspective, then traverse the common suffix
@@ -345,7 +353,7 @@ impl AccumulatorStack {
                 WHITE,
                 feature_transformer,
                 white_ksq,
-                white_opp_queen,
+                white_block,
                 target,
                 computed,
             );
@@ -356,7 +364,7 @@ impl AccumulatorStack {
                 BLACK,
                 feature_transformer,
                 black_ksq,
-                black_opp_queen,
+                black_block,
                 target,
                 computed,
             );
@@ -368,8 +376,8 @@ impl AccumulatorStack {
                 feature_transformer,
                 white_ksq,
                 black_ksq,
-                white_opp_queen,
-                black_opp_queen,
+                white_block,
+                black_block,
                 target,
                 computed,
             );
@@ -394,7 +402,7 @@ fn target_and_source(
     (target, source)
 }
 
-impl crate::nnue::Accumulators for AccumulatorStack {
+impl crate::nnue::Accumulators<crate::variant::Chess> for AccumulatorStack {
     type Dirties = Dirties;
 
     #[inline(always)]
@@ -403,13 +411,13 @@ impl crate::nnue::Accumulators for AccumulatorStack {
     }
 
     #[inline(always)]
-    fn reset(&mut self) {
+    fn reset(&mut self, _network: Option<&Network>) {
         AccumulatorStack::reset(self);
     }
 
     #[inline(always)]
-    fn push(&mut self) -> &mut Dirties {
-        AccumulatorStack::push(self)
+    fn push(&mut self, pos: &Position) -> &mut Dirties {
+        AccumulatorStack::push(self, pos)
     }
 
     #[inline(always)]
@@ -436,31 +444,32 @@ impl crate::nnue::Caches for AccumulatorCaches {
 // The accumulations are updated a tile at a time, the vectors of each kept
 // in registers while every weight row is applied to it. The functions on
 // tiles take the index `j` of the tile's first value, a multiple of
-// TILE_HEIGHT below DIMENSIONS, and pointers to accumulations or weight rows
-// of DIMENSIONS values; the index lists hold indices of weight rows.
+// TILE_HEIGHT below DIMENSIONS, or pointers to the tile's first value in an
+// accumulation or a weight row of DIMENSIONS values; the index lists hold
+// indices of weight rows.
 
 const _: () = assert!(DIMENSIONS.is_multiple_of(TILE_HEIGHT));
 
-type Tile = [VecT; NUM_REGS];
+pub(super) type Tile = [VecT; NUM_REGS];
 
 #[inline(always)]
-unsafe fn load_tile(j: usize, data: *const i16) -> Tile {
+pub(super) unsafe fn load_tile(j: usize, data: *const i16) -> Tile {
     std::array::from_fn(|k| unsafe { vec_load(data.add(j + k * LANES)) })
 }
 
 #[inline(always)]
-unsafe fn store_tile(j: usize, dest: *mut i16, acc: &Tile) {
+pub(super) unsafe fn store_tile(j: usize, dest: *mut i16, acc: &Tile) {
     for (k, &value) in acc.iter().enumerate() {
         unsafe { vec_store(dest.add(j + k * LANES), value) };
     }
 }
 
-/// Adds (SIGN 1) or subtracts (SIGN -1) the tile of `data`.
+/// Adds (SIGN 1) or subtracts (SIGN -1) the tile that `data` points at.
 #[inline(always)]
-unsafe fn apply<const SIGN: i32>(j: usize, acc: &mut Tile, data: *const i16) {
+pub(super) unsafe fn apply<const SIGN: i32>(acc: &mut Tile, data: *const i16) {
     const { assert!(SIGN == 1 || SIGN == -1) };
     for (k, acc) in acc.iter_mut().enumerate() {
-        let column = unsafe { vec_load(data.add(j + k * LANES)) };
+        let column = unsafe { vec_load(data.add(k * LANES)) };
         *acc = if SIGN == 1 {
             vec_add_16(*acc, column)
         } else {
@@ -469,11 +478,33 @@ unsafe fn apply<const SIGN: i32>(j: usize, acc: &mut Tile, data: *const i16) {
     }
 }
 
-/// Adds or subtracts the tile of a row of 8-bit weights.
+// The tile loops below walk all changed weight rows together, one tile at a
+// time, and the hardware prefetcher doesn't keep up with that many rows:
+// prefetch the next tile of a row while its current tile is being added. On
+// a row's last tile this hits the next row, which is harmless since
+// prefetches never fault. Rows of only two tiles (AVX-512) get no lead time
+// from this and are faster without it, and so are AMD Zen 1/2, which only
+// get builds without pext (Stockfish's 9d24e938).
+#[cfg(use_pext)]
 #[inline(always)]
-unsafe fn apply_feature_single<const SIGN: i32>(j: usize, acc: &mut Tile, data: *const i8) {
+fn prefetch_next_tile(data: *const i8) {
+    const CACHE_LINE_SIZE: usize = 64;
+    if DIMENSIONS / TILE_HEIGHT > 2 {
+        for k in (0..TILE_HEIGHT).step_by(CACHE_LINE_SIZE) {
+            crate::misc::prefetch(data.wrapping_add(TILE_HEIGHT + k));
+        }
+    }
+}
+
+#[cfg(all(use_paired_widening_add, not(use_pext)))]
+#[inline(always)]
+fn prefetch_next_tile(_: *const i8) {}
+
+/// Adds or subtracts the tile of a row of 8-bit weights that `column`
+/// points at.
+#[inline(always)]
+unsafe fn apply_feature_single<const SIGN: i32>(acc: &mut Tile, column: *const i8) {
     const { assert!(SIGN == 1 || SIGN == -1) };
-    let column = unsafe { data.add(j) };
 
     // A vector of 16 weights widens into two of the accumulators'.
     #[cfg(use_neon)]
@@ -497,6 +528,7 @@ unsafe fn apply_feature_single<const SIGN: i32>(j: usize, acc: &mut Tile, data: 
     #[cfg(use_paired_widening_add)]
     {
         const { assert!(NUM_REGS.is_multiple_of(2)) };
+        prefetch_next_tile(column);
         let zero = vec_zero();
         unrolled::<{ NUM_REGS / 2 }>(|pair| {
             let k = 2 * pair;
@@ -530,21 +562,22 @@ unsafe fn apply_feature_single<const SIGN: i32>(j: usize, acc: &mut Tile, data: 
 /// one per row.
 #[cfg(use_paired_widening_add)]
 #[inline(always)]
-unsafe fn apply_feature_pair<const SIGN: i32>(
-    j: usize,
+pub(super) unsafe fn apply_feature_pair<const SIGN: i32>(
     acc: &mut Tile,
     data0: *const i8,
     data1: *const i8,
 ) {
     const { assert!(SIGN == 1 || SIGN == -1) };
     const { assert!(NUM_REGS.is_multiple_of(2)) };
+    prefetch_next_tile(data0);
+    prefetch_next_tile(data1);
     let ones = vec_set_8(1);
     unrolled::<{ NUM_REGS / 2 }>(|pair| {
         let k = 2 * pair;
         let (w0, w1) = unsafe {
             (
-                vec_load(data0.add(j + k * LANES).cast()),
-                vec_load(data1.add(j + k * LANES).cast()),
+                vec_load(data0.add(k * LANES).cast()),
+                vec_load(data1.add(k * LANES).cast()),
             )
         };
         let lo = vec_maddubs_16(ones, vec_unpacklo_8(w0, w1));
@@ -556,6 +589,31 @@ unsafe fn apply_feature_pair<const SIGN: i32>(
             acc[k] = vec_sub_16(acc[k], lo);
             acc[k + 1] = vec_sub_16(acc[k + 1], hi);
         }
+    });
+}
+
+/// Adds the tile of the row `add` and subtracts that of the row `sub` in one
+/// maddubs per half: both rows are biased to u8, so that maddubs' unsigned
+/// operand is valid; the bias cancels, and |add - sub| <= 255 cannot
+/// saturate.
+#[cfg(use_paired_widening_add)]
+#[inline(always)]
+unsafe fn apply_feature_diff(acc: &mut Tile, add: *const i8, sub: *const i8) {
+    const { assert!(NUM_REGS.is_multiple_of(2)) };
+    prefetch_next_tile(add);
+    prefetch_next_tile(sub);
+    let bias = vec_set_8(-128);
+    let signs = vec_set_16(-255); // i8 pairs (+1, -1)
+    unrolled::<{ NUM_REGS / 2 }>(|pair| {
+        let k = 2 * pair;
+        let (ua, us) = unsafe {
+            (
+                vec_xor(vec_load(add.add(k * LANES).cast()), bias),
+                vec_xor(vec_load(sub.add(k * LANES).cast()), bias),
+            )
+        };
+        acc[k] = vec_add_16(acc[k], vec_maddubs_16(vec_unpacklo_8(ua, us), signs));
+        acc[k + 1] = vec_add_16(acc[k + 1], vec_maddubs_16(vec_unpackhi_8(ua, us), signs));
     });
 }
 
@@ -576,147 +634,301 @@ fn unrolled<const N: usize>(mut f: impl FnMut(usize)) {
     calls!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
 }
 
-/// The int8 weight rows (piece-square, threat and pawn-pair features alike)
-/// that have to be added to or removed from an accumulator. Resolving the
-/// feature indices to row pointers once, outside the tile loop, also lets
-/// rows of different feature sets be processed together in pairs.
-#[cfg(use_paired_widening_add)]
-struct WeightRows<const MAX_ROWS: usize>(ValueList<*const i8, MAX_ROWS>);
+/// Adds (SIGN 1) or subtracts (SIGN -1) the tiles of the rows of
+/// `indices`, `weights` pointing at the tile of the weights' first row: the
+/// base already includes the tile's offset.
+#[inline(always)]
+pub(super) unsafe fn apply_features<const SIGN: i32>(
+    acc: &mut Tile,
+    indices: &[u16],
+    weights: *const i8,
+) {
+    const { assert!(SIGN == 1 || SIGN == -1) };
+    // SAFETY: the index is a feature's, whose row is in the weights.
+    let row = |index: u16| unsafe { weights.add(usize::from(index) * DIMENSIONS) };
 
-#[cfg(use_paired_widening_add)]
-type PsqWeightRows = WeightRows<{ k32q2::MAX_ACTIVE_DIMENSIONS }>;
-/// Room for the rows of both feature sets, rounded up to a power of two as
-/// a ValueList's capacity is.
-#[cfg(use_paired_widening_add)]
-type AllWeightRows = WeightRows<
-    { (k32q2::MAX_ACTIVE_DIMENSIONS + full_threats::MAX_ACTIVE_DIMENSIONS).next_power_of_two() },
->;
-#[cfg(use_paired_widening_add)]
-type IncrementalWeightRows = AllWeightRows;
-
-/// Without paired widening, gathering the rows gains nothing and costs
-/// time, so they stay in their lists of indices, which the tile loop
-/// resolves as it did before Stockfish's e08dfa80. An incremental update
-/// changes one or two piece-square features.
-#[cfg(not(use_paired_widening_add))]
-struct WeightRows<'a, const INCREMENTAL: bool = false> {
-    psq: Option<(&'a PsqIndexList, *const i8)>,
-    threats: Option<(&'a ThreatIndexList, *const i8)>,
+    #[cfg(use_paired_widening_add)]
+    let indices = {
+        let (pairs, rest) = indices.as_chunks::<2>();
+        for &[first, second] in pairs {
+            unsafe { apply_feature_pair::<SIGN>(acc, row(first), row(second)) };
+        }
+        rest
+    };
+    for &index in indices {
+        unsafe { apply_feature_single::<SIGN>(acc, row(index)) };
+    }
 }
 
-#[cfg(not(use_paired_widening_add))]
-type PsqWeightRows<'a> = WeightRows<'a>;
-#[cfg(not(use_paired_widening_add))]
-type AllWeightRows<'a> = WeightRows<'a>;
-#[cfg(not(use_paired_widening_add))]
-type IncrementalWeightRows<'a> = WeightRows<'a, true>;
+/// The piece-square rows of one sign: the indices of rows of a block's
+/// weights, or, for an incremental update, the addresses of the rows, found
+/// once for all the tiles.
+pub(super) trait PsqRows {
+    fn len(&self) -> usize;
 
-#[cfg(not(use_paired_widening_add))]
-impl<'a, const INCREMENTAL: bool> WeightRows<'a, INCREMENTAL> {
+    /// The tile `j` of the `i`th row, `base` pointing at the tile of the
+    /// weights' first row.
+    ///
+    /// # Safety
+    ///
+    /// `i` is below `len()`, and the row's tile is in the weights.
+    unsafe fn row(&self, i: usize, base: *const i8, j: usize) -> *const i8;
+}
+
+impl PsqRows for [u16] {
     #[inline(always)]
-    fn new() -> Self {
-        WeightRows {
-            psq: None,
-            threats: None,
+    fn len(&self) -> usize {
+        <[u16]>::len(self)
+    }
+
+    #[inline(always)]
+    unsafe fn row(&self, i: usize, base: *const i8, _j: usize) -> *const i8 {
+        unsafe { base.add(usize::from(*self.get_unchecked(i)) * DIMENSIONS) }
+    }
+}
+
+impl<const N: usize> PsqRows for [*const i8; N] {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        N
+    }
+
+    #[inline(always)]
+    unsafe fn row(&self, i: usize, _base: *const i8, j: usize) -> *const i8 {
+        unsafe { self.get_unchecked(i).add(j) }
+    }
+}
+
+/// Applies one sign's piece-square rows and threat and pawn-pair rows to
+/// the tile `j`, `psq_weights` and `thr_weights` pointing at the tiles of
+/// their weights' first rows. With paired widening, an odd row is held back
+/// and returned, so that it can be combined with the other sign's odd row.
+#[inline(always)]
+pub(super) unsafe fn apply_features_but_odd<const SIGN: i32, P: PsqRows + ?Sized>(
+    j: usize,
+    acc: &mut Tile,
+    psq: &P,
+    thr: &[u16],
+    psq_weights: *const i8,
+    thr_weights: *const i8,
+) -> Option<*const i8> {
+    // SAFETY: the rows' tiles are in their weights.
+    let psq_row = |i: usize| unsafe { psq.row(i, psq_weights, j) };
+    let psq_count = psq.len();
+
+    #[cfg(use_paired_widening_add)]
+    {
+        let thr_row = |index: u16| unsafe { thr_weights.add(usize::from(index) * DIMENSIONS) };
+        let mut thr = thr;
+        let mut i = 0;
+        while i + 1 < psq_count {
+            unsafe { apply_feature_pair::<SIGN>(acc, psq_row(i), psq_row(i + 1)) };
+            i += 2;
         }
-    }
 
-    #[inline(always)]
-    fn append_psq(&mut self, list: &'a PsqIndexList, feature_transformer: &FeatureTransformer) {
-        debug_assert!(self.psq.is_none());
-        self.psq = Some((list, feature_transformer.weights.0.as_ptr()));
-    }
-
-    #[inline(always)]
-    fn append_threat(
-        &mut self,
-        list: &'a ThreatIndexList,
-        feature_transformer: &FeatureTransformer,
-    ) {
-        debug_assert!(self.threats.is_none());
-        self.threats = Some((list, feature_transformer.threat_and_pp_weights.0.as_ptr()));
-    }
-
-    /// Adds (SIGN 1) or subtracts (SIGN -1) the tile of each row.
-    #[inline(always)]
-    unsafe fn apply<const SIGN: i32>(&self, j: usize, acc: &mut Tile) {
-        const { assert!(SIGN == 1 || SIGN == -1) };
-        if let Some((list, weights)) = self.psq {
-            let row = |index: u16| {
-                debug_assert!(usize::from(index) < PSQ_DIMENSIONS);
-                // SAFETY: the index is a feature's, whose row is in the weights.
-                unsafe { weights.add(usize::from(index) * DIMENSIONS) }
+        // Pair the odd psq row with the first threat/pp row of the same
+        // sign, if any.
+        if i < psq_count {
+            let Some((&first, rest)) = thr.split_first() else {
+                return Some(psq_row(i));
             };
-            if INCREMENTAL {
-                debug_assert!(list.len() == 1 || list.len() == 2);
-                if let [first, rest @ ..] = list.as_slice() {
-                    unsafe { apply_feature_single::<SIGN>(j, acc, row(*first)) };
-                    if let [second, ..] = rest {
-                        unsafe { apply_feature_single::<SIGN>(j, acc, row(*second)) };
-                    }
-                }
-            } else {
-                for &index in list {
-                    unsafe { apply_feature_single::<SIGN>(j, acc, row(index)) };
-                }
-            }
+            unsafe { apply_feature_pair::<SIGN>(acc, psq_row(i), thr_row(first)) };
+            thr = rest;
         }
-        if let Some((list, weights)) = self.threats {
-            for &index in list {
-                debug_assert!(usize::from(index) < THREAT_AND_PP_DIMENSIONS);
-                // SAFETY: as for the piece-square rows.
-                let row = unsafe { weights.add(usize::from(index) * DIMENSIONS) };
-                unsafe { apply_feature_single::<SIGN>(j, acc, row) };
-            }
+
+        let mut odd = None;
+        if !thr.len().is_multiple_of(2)
+            && let Some((&last, rest)) = thr.split_last()
+        {
+            odd = Some(thr_row(last));
+            thr = rest;
+        }
+        unsafe { apply_features::<SIGN>(acc, thr, thr_weights) };
+        odd
+    }
+
+    #[cfg(not(use_paired_widening_add))]
+    {
+        for i in 0..psq_count {
+            unsafe { apply_feature_single::<SIGN>(acc, psq_row(i)) };
+        }
+        unsafe { apply_features::<SIGN>(acc, thr, thr_weights) };
+        None
+    }
+}
+
+/// Applies the rows that apply_features_but_odd held back: with paired
+/// widening, a removed row and an added one in one difference.
+#[inline(always)]
+pub(super) unsafe fn apply_odd_features(
+    acc: &mut Tile,
+    removed: Option<*const i8>,
+    added: Option<*const i8>,
+) {
+    #[cfg(use_paired_widening_add)]
+    if let (Some(removed), Some(added)) = (removed, added) {
+        unsafe { apply_feature_diff(acc, added, removed) };
+        return;
+    }
+    if let Some(removed) = removed {
+        unsafe { apply_feature_single::<-1>(acc, removed) };
+    }
+    if let Some(added) = added {
+        unsafe { apply_feature_single::<1>(acc, added) };
+    }
+}
+
+/// Removes the rows of `removed` and adds those of `added`, `weights`
+/// pointing at the tile of the weights' first row: with paired widening, an
+/// odd row of each goes with the other in one difference.
+#[inline(always)]
+pub(super) unsafe fn apply_changed_features(
+    acc: &mut Tile,
+    removed: &[u16],
+    added: &[u16],
+    weights: *const i8,
+) {
+    // No threat rows: their weights are never read. Index lists read no
+    // tile index.
+    let none = std::ptr::null();
+    unsafe {
+        let odd_removed = apply_features_but_odd::<-1, _>(0, acc, removed, &[], weights, none);
+        let odd_added = apply_features_but_odd::<1, _>(0, acc, added, &[], weights, none);
+        apply_odd_features(acc, odd_removed, odd_added);
+    }
+}
+
+/// Removes and adds the rows of piece-square features, from `psq_weights`,
+/// those of their block.
+#[inline(always)]
+unsafe fn apply_psq_features(
+    j: usize,
+    acc: &mut Tile,
+    removed: &PsqIndexList,
+    added: &PsqIndexList,
+    psq_weights: *const i8,
+) {
+    debug_assert!(
+        removed
+            .iter()
+            .chain(added.iter())
+            .all(|&i| usize::from(i) < PSQ_BLOCK_DIMENSIONS)
+    );
+    unsafe {
+        apply_changed_features(
+            acc,
+            removed.as_slice(),
+            added.as_slice(),
+            psq_weights.add(j),
+        );
+    }
+}
+
+/// Applies the rows of threat and pawn-pair features.
+#[inline(always)]
+unsafe fn apply_threat_features<const SIGN: i32>(
+    j: usize,
+    acc: &mut Tile,
+    list: &ThreatIndexList,
+    feature_transformer: &FeatureTransformer,
+) {
+    debug_assert!(
+        list.iter()
+            .all(|&i| usize::from(i) < THREAT_AND_PP_DIMENSIONS)
+    );
+    let weights = feature_transformer.threat_and_pp_weights.0.as_ptr();
+    unsafe { apply_features::<SIGN>(acc, list.as_slice(), weights.add(j)) };
+}
+
+/// Removes and adds the rows of piece-square features and of threat and
+/// pawn-pair features: with paired widening, the last row of an odd number
+/// of piece-square rows goes with the first threat row of the same sign,
+/// and an odd removed row with an odd added one.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn apply_combined_features<R: PsqRows + ?Sized, A: PsqRows + ?Sized>(
+    j: usize,
+    acc: &mut Tile,
+    psq_removed: &R,
+    thr_removed: &ThreatIndexList,
+    psq_added: &A,
+    thr_added: &ThreatIndexList,
+    feature_transformer: &FeatureTransformer,
+    psq_base: *const i8,
+) {
+    // SAFETY: tiles of the weights, as for the rows.
+    unsafe {
+        let psq_weights = psq_base.add(j);
+        let thr_weights = feature_transformer.threat_and_pp_weights.0.as_ptr().add(j);
+        let odd_removed = apply_features_but_odd::<-1, R>(
+            j,
+            acc,
+            psq_removed,
+            thr_removed.as_slice(),
+            psq_weights,
+            thr_weights,
+        );
+        let odd_added = apply_features_but_odd::<1, A>(
+            j,
+            acc,
+            psq_added,
+            thr_added.as_slice(),
+            psq_weights,
+            thr_weights,
+        );
+        apply_odd_features(acc, odd_removed, odd_added);
+    }
+}
+
+/// An incremental update of one perspective's accumulation by REMOVED
+/// piece-square rows removed and ADDED added, whose addresses are found
+/// once for all the tiles.
+#[allow(clippy::too_many_arguments)]
+fn apply_combined_counted<const REMOVED: usize, const ADDED: usize>(
+    feature_transformer: &FeatureTransformer,
+    from_acc: &[i16; DIMENSIONS],
+    to_acc: &mut [i16; DIMENSIONS],
+    psq_added: &PsqIndexList,
+    psq_removed: &PsqIndexList,
+    thr_added: &ThreatIndexList,
+    thr_removed: &ThreatIndexList,
+    psq_weights: &[i8],
+) {
+    const { assert!(REMOVED == 1 || REMOVED == 2) };
+    const { assert!(ADDED == 1 || ADDED == 2) };
+
+    let from = from_acc.as_ptr();
+    let to = to_acc.as_mut_ptr();
+    let psq_weights = psq_weights.as_ptr();
+
+    // SAFETY: the index is a feature's, whose row is in the weights.
+    let row = |index: u16| unsafe { psq_weights.add(usize::from(index) * DIMENSIONS) };
+    let removed_weights: [*const i8; REMOVED] = std::array::from_fn(|i| row(psq_removed[i]));
+    let added_weights: [*const i8; ADDED] = std::array::from_fn(|i| row(psq_added[i]));
+
+    for j in (0..DIMENSIONS).step_by(TILE_HEIGHT) {
+        // SAFETY: a tile of the accumulations, and rows of the lists.
+        unsafe {
+            let mut acc = load_tile(j, from);
+
+            apply_combined_features(
+                j,
+                &mut acc,
+                &removed_weights,
+                thr_removed,
+                &added_weights,
+                thr_added,
+                feature_transformer,
+                psq_weights,
+            );
+
+            store_tile(j, to, &acc);
         }
     }
 }
 
-#[cfg(use_paired_widening_add)]
-impl<const MAX_ROWS: usize> WeightRows<MAX_ROWS> {
-    #[inline(always)]
-    fn new() -> Self {
-        WeightRows(ValueList::new())
-    }
-
-    #[inline(always)]
-    fn append_psq(&mut self, list: &PsqIndexList, feature_transformer: &FeatureTransformer) {
-        debug_assert!(self.0.len() + list.len() <= MAX_ROWS);
-        let weights = feature_transformer.weights.0.as_ptr();
-        for &index in list {
-            debug_assert!(usize::from(index) < PSQ_DIMENSIONS);
-            // SAFETY: the index is a feature's, whose row is in the weights.
-            let row = unsafe { weights.add(usize::from(index) * DIMENSIONS) };
-            self.0.push(row);
-        }
-    }
-
-    #[inline(always)]
-    fn append_threat(&mut self, list: &ThreatIndexList, feature_transformer: &FeatureTransformer) {
-        debug_assert!(self.0.len() + list.len() <= MAX_ROWS);
-        let weights = feature_transformer.threat_and_pp_weights.0.as_ptr();
-        for &index in list {
-            debug_assert!(usize::from(index) < THREAT_AND_PP_DIMENSIONS);
-            // SAFETY: as for append_psq.
-            let row = unsafe { weights.add(usize::from(index) * DIMENSIONS) };
-            self.0.push(row);
-        }
-    }
-
-    /// Adds (SIGN 1) or subtracts (SIGN -1) the tile of each row.
-    #[inline(always)]
-    unsafe fn apply<const SIGN: i32>(&self, j: usize, acc: &mut Tile) {
-        const { assert!(SIGN == 1 || SIGN == -1) };
-        let (pairs, rest) = self.0.as_slice().as_chunks::<2>();
-        for &[row0, row1] in pairs {
-            unsafe { apply_feature_pair::<SIGN>(j, acc, row0, row1) };
-        }
-        for &row in rest {
-            unsafe { apply_feature_single::<SIGN>(j, acc, row) };
-        }
-    }
-}
-
+/// An incremental update of one perspective's accumulation, which removes
+/// and adds one or two piece-square rows each.
 #[allow(clippy::too_many_arguments)]
 fn apply_combined(
     feature_transformer: &FeatureTransformer,
@@ -726,35 +938,48 @@ fn apply_combined(
     psq_removed: &PsqIndexList,
     thr_added: &ThreatIndexList,
     thr_removed: &ThreatIndexList,
+    psq_weights: &[i8],
 ) {
-    let from = from_acc.as_ptr();
-    let to = to_acc.as_mut_ptr();
+    debug_assert!(psq_removed.len() == 1 || psq_removed.len() == 2);
+    debug_assert!(psq_added.len() == 1 || psq_added.len() == 2);
+    debug_assert!(
+        psq_removed
+            .iter()
+            .chain(psq_added.iter())
+            .all(|&i| usize::from(i) < PSQ_BLOCK_DIMENSIONS)
+    );
+    debug_assert!(
+        thr_removed
+            .iter()
+            .chain(thr_added.iter())
+            .all(|&i| usize::from(i) < THREAT_AND_PP_DIMENSIONS)
+    );
 
-    let mut removed = IncrementalWeightRows::new();
-    let mut added = IncrementalWeightRows::new();
-    removed.append_psq(psq_removed, feature_transformer);
-    removed.append_threat(thr_removed, feature_transformer);
-    added.append_psq(psq_added, feature_transformer);
-    added.append_threat(thr_added, feature_transformer);
-
-    for j in (0..DIMENSIONS).step_by(TILE_HEIGHT) {
-        // SAFETY: a tile of the accumulations, and rows of the lists.
-        unsafe {
-            let mut acc = load_tile(j, from);
-
-            removed.apply::<-1>(j, &mut acc);
-            added.apply::<1>(j, &mut acc);
-
-            store_tile(j, to, &acc);
-        }
-    }
+    // Dispatch once; feature counts and row addresses stay fixed across
+    // tiles.
+    let apply = match (psq_removed.len(), psq_added.len()) {
+        (1, 1) => apply_combined_counted::<1, 1>,
+        (1, _) => apply_combined_counted::<1, 2>,
+        (_, 1) => apply_combined_counted::<2, 1>,
+        _ => apply_combined_counted::<2, 2>,
+    };
+    apply(
+        feature_transformer,
+        from_acc,
+        to_acc,
+        psq_added,
+        psq_removed,
+        thr_added,
+        thr_removed,
+        psq_weights,
+    );
 }
 
 fn update_accumulator_incremental<const FORWARD: bool>(
     perspective: Color,
     feature_transformer: &FeatureTransformer,
     ksq: Square,
-    opponent_has_queen: bool,
+    psq_block: usize,
     target_state: &mut AccumulatorState,
     computed: &AccumulatorState,
 ) {
@@ -815,14 +1040,7 @@ fn update_accumulator_incremental<const FORWARD: bool>(
         threat_pp_base,
         pf_stride,
     );
-    k32q2::append_changed_indices(
-        perspective,
-        ksq,
-        &dirties.dirty_piece,
-        opponent_has_queen,
-        psq_out,
-        psq_in,
-    );
+    k32h3::append_changed_indices(perspective, ksq, &dirties.dirty_piece, psq_out, psq_in);
 
     apply_combined(
         feature_transformer,
@@ -832,6 +1050,7 @@ fn update_accumulator_incremental<const FORWARD: bool>(
         &psq_removed,
         &thr_added,
         &thr_removed,
+        feature_transformer.psq_weights(psq_block),
     );
 
     target_state.computed[p] = true;
@@ -841,8 +1060,8 @@ fn update_accumulator_incremental_both(
     feature_transformer: &FeatureTransformer,
     white_ksq: Square,
     black_ksq: Square,
-    white_opp_queen: bool,
-    black_opp_queen: bool,
+    white_block: usize,
+    black_block: usize,
     target_state: &mut AccumulatorState,
     computed: &AccumulatorState,
 ) {
@@ -886,22 +1105,18 @@ fn update_accumulator_incremental_both(
             pf_stride,
         );
     }
-    for (perspective, ksq, opponent_has_queen) in [
-        (WHITE, white_ksq, white_opp_queen),
-        (BLACK, black_ksq, black_opp_queen),
-    ] {
+    for (perspective, ksq) in [(WHITE, white_ksq), (BLACK, black_ksq)] {
         let p = perspective.idx();
-        k32q2::append_changed_indices(
+        k32h3::append_changed_indices(
             perspective,
             ksq,
             &dirties.dirty_piece,
-            opponent_has_queen,
             &mut psq_removed[p],
             &mut psq_added[p],
         );
     }
 
-    for p in [WHITE.idx(), BLACK.idx()] {
+    for (p, psq_block) in [(WHITE.idx(), white_block), (BLACK.idx(), black_block)] {
         apply_combined(
             feature_transformer,
             &computed.accumulation[p],
@@ -910,6 +1125,7 @@ fn update_accumulator_incremental_both(
             &psq_removed[p],
             &thr_added[p],
             &thr_removed[p],
+            feature_transformer.psq_weights(psq_block),
         );
     }
 
@@ -982,6 +1198,57 @@ fn get_changed_pieces_scalar(
     Bitboard(changed)
 }
 
+/// Appends the piece-square feature indices that differ between two
+/// boards, given the bitboards of the pieces on them before and after the
+/// change.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(super) fn append_changed_psq_indices(
+    perspective: Color,
+    ksq: Square,
+    old_pieces: &[Piece; SQUARE_NB],
+    old_bb: Bitboard,
+    new_pieces: &[Piece; SQUARE_NB],
+    new_bb: Bitboard,
+    removed: &mut PsqIndexList,
+    added: &mut PsqIndexList,
+) {
+    let changed_bb = get_changed_pieces(old_pieces, new_pieces);
+    let removed_bb = changed_bb & old_bb;
+    let added_bb = changed_bb & new_bb;
+
+    #[cfg(use_avx512icl)]
+    k32h3::write_indices(
+        old_pieces,
+        new_pieces,
+        removed_bb,
+        added_bb,
+        perspective,
+        ksq,
+        removed,
+        added,
+    );
+    #[cfg(not(use_avx512icl))]
+    {
+        for sq in removed_bb {
+            removed.push(k32h3::make_index(
+                perspective,
+                sq,
+                old_pieces[sq.idx()],
+                ksq,
+            ));
+        }
+        for sq in added_bb {
+            added.push(k32h3::make_index(
+                perspective,
+                sq,
+                new_pieces[sq.idx()],
+                ksq,
+            ));
+        }
+    }
+}
+
 /// Updates accumulator for a king move, and also updates the accumulator
 /// cache for the new king position.
 fn update_accumulator_hybrid(
@@ -1024,12 +1291,13 @@ fn update_accumulator_hybrid(
     previous_pieces[old_ksq.idx()] = make_piece(perspective, KING);
     previous_piece_bb |= square_bb(old_ksq);
 
-    let opponent_has_queen = pos.pieces_cpt(!perspective, QUEEN).any();
-    let [old_entries, new_entries] = cache.entries[usize::from(opponent_has_queen)]
+    let psq_block = k32h3::block_of(pos, perspective);
+    let [old_entries, new_entries] = cache.entries[psq_block]
         .get_disjoint_mut([old_ksq.idx(), new_ksq.idx()])
         .expect("a king move changes its square");
     let old_entry = &old_entries[p];
     let new_entry = &mut new_entries[p];
+    let psq_weights = feature_transformer.psq_weights(psq_block).as_ptr();
 
     // "Remove" means we need to remove them from the cache entry,
     // "Add" means add them to the entry to get the accumulator we want
@@ -1038,78 +1306,26 @@ fn update_accumulator_hybrid(
     let mut new_remove = PsqIndexList::new();
     let mut new_add = PsqIndexList::new();
 
-    let old_changed_bb = get_changed_pieces(&old_entry.pieces, &previous_pieces);
-    let old_removed_bb = old_changed_bb & old_entry.piece_bb;
-    let old_added_bb = old_changed_bb & previous_piece_bb;
-
-    let new_changed_bb = get_changed_pieces(&new_entry.pieces, current_pieces);
-    let new_removed_bb = new_changed_bb & new_entry.piece_bb;
-    let new_added_bb = new_changed_bb & pos.pieces();
-
-    #[cfg(use_avx512icl)]
-    {
-        k32q2::write_indices(
-            &old_entry.pieces,
-            &previous_pieces,
-            old_removed_bb,
-            old_added_bb,
-            perspective,
-            old_ksq,
-            opponent_has_queen,
-            &mut old_remove,
-            &mut old_add,
-        );
-        k32q2::write_indices(
-            &new_entry.pieces,
-            current_pieces,
-            new_removed_bb,
-            new_added_bb,
-            perspective,
-            new_ksq,
-            opponent_has_queen,
-            &mut new_remove,
-            &mut new_add,
-        );
-    }
-    #[cfg(not(use_avx512icl))]
-    {
-        for sq in old_removed_bb {
-            old_remove.push(k32q2::make_index(
-                perspective,
-                sq,
-                old_entry.pieces[sq.idx()],
-                old_ksq,
-                opponent_has_queen,
-            ));
-        }
-        for sq in old_added_bb {
-            old_add.push(k32q2::make_index(
-                perspective,
-                sq,
-                previous_pieces[sq.idx()],
-                old_ksq,
-                opponent_has_queen,
-            ));
-        }
-        for sq in new_removed_bb {
-            new_remove.push(k32q2::make_index(
-                perspective,
-                sq,
-                new_entry.pieces[sq.idx()],
-                new_ksq,
-                opponent_has_queen,
-            ));
-        }
-        for sq in new_added_bb {
-            new_add.push(k32q2::make_index(
-                perspective,
-                sq,
-                current_pieces[sq.idx()],
-                new_ksq,
-                opponent_has_queen,
-            ));
-        }
-    }
+    append_changed_psq_indices(
+        perspective,
+        old_ksq,
+        &old_entry.pieces,
+        old_entry.piece_bb,
+        &previous_pieces,
+        previous_piece_bb,
+        &mut old_remove,
+        &mut old_add,
+    );
+    append_changed_psq_indices(
+        perspective,
+        new_ksq,
+        &new_entry.pieces,
+        new_entry.piece_bb,
+        current_pieces,
+        pos.pieces(),
+        &mut new_remove,
+        &mut new_add,
+    );
 
     // also contain pp indices
     let mut thr_removed = ThreatIndexList::new();
@@ -1140,42 +1356,37 @@ fn update_accumulator_hybrid(
     let old_acc = old_entry.accumulation.as_ptr();
     let new_acc = new_entry.accumulation.as_mut_ptr();
 
-    let mut new_entry_removed = PsqWeightRows::new();
-    let mut new_entry_added = PsqWeightRows::new();
-    new_entry_removed.append_psq(&new_remove, feature_transformer);
-    new_entry_added.append_psq(&new_add, feature_transformer);
-
-    // The old entry's removed psq features have to be added back, its added
-    // ones removed
-    let mut removed = AllWeightRows::new();
-    let mut added = AllWeightRows::new();
-    added.append_psq(&old_remove, feature_transformer);
-    added.append_threat(&thr_added, feature_transformer);
-    removed.append_psq(&old_add, feature_transformer);
-    removed.append_threat(&thr_removed, feature_transformer);
-
     for j in (0..DIMENSIONS).step_by(TILE_HEIGHT) {
         // SAFETY: a tile of the accumulations, and rows of the lists.
         unsafe {
             let mut acc = load_tile(j, new_acc);
 
-            new_entry_removed.apply::<-1>(j, &mut acc);
-            new_entry_added.apply::<1>(j, &mut acc);
+            apply_psq_features(j, &mut acc, &new_remove, &new_add, psq_weights);
 
             store_tile(j, new_acc, &acc);
 
             // adding the old accumulator adds (most of) the threats and pp
             // weights that we need
-            apply::<1>(j, &mut acc, from_acc);
+            apply::<1>(&mut acc, from_acc.add(j));
             // But we have added a whole bunch of psq weights for the wrong
             // king bucket which we need to remove
             // first we remove the cached psq accumulation for the old king
             // position...
-            apply::<-1>(j, &mut acc, old_acc);
+            apply::<-1>(&mut acc, old_acc.add(j));
 
             // ... then we adjust
-            removed.apply::<-1>(j, &mut acc);
-            added.apply::<1>(j, &mut acc);
+            // The old entry's removed psq features have to be added back,
+            // its added ones removed
+            apply_combined_features(
+                j,
+                &mut acc,
+                old_add.as_slice(),
+                &thr_removed,
+                old_remove.as_slice(),
+                &thr_added,
+                feature_transformer,
+                psq_weights,
+            );
 
             store_tile(j, to_acc, &acc);
         }
@@ -1197,49 +1408,23 @@ fn update_accumulator_refresh_cache(
     cache: &mut AccumulatorCaches,
 ) {
     let p = perspective.idx();
-    let opponent_has_queen = pos.pieces_cpt(!perspective, QUEEN).any();
+    let psq_block = k32h3::block_of(pos, perspective);
     let ksq = pos.king_square(perspective);
-    let entry = &mut cache.entries[usize::from(opponent_has_queen)][ksq.idx()][p];
+    let entry = &mut cache.entries[psq_block][ksq.idx()][p];
+    let psq_weights = feature_transformer.psq_weights(psq_block).as_ptr();
     let mut removed = PsqIndexList::new();
     let mut added = PsqIndexList::new();
 
-    let changed_bb = get_changed_pieces(&entry.pieces, pos.piece_array());
-    let removed_bb = changed_bb & entry.piece_bb;
-    let added_bb = changed_bb & pos.pieces();
-
-    #[cfg(use_avx512icl)]
-    k32q2::write_indices(
-        &entry.pieces,
-        pos.piece_array(),
-        removed_bb,
-        added_bb,
+    append_changed_psq_indices(
         perspective,
         ksq,
-        opponent_has_queen,
+        &entry.pieces,
+        entry.piece_bb,
+        pos.piece_array(),
+        pos.pieces(),
         &mut removed,
         &mut added,
     );
-    #[cfg(not(use_avx512icl))]
-    {
-        for sq in removed_bb {
-            removed.push(k32q2::make_index(
-                perspective,
-                sq,
-                entry.pieces[sq.idx()],
-                ksq,
-                opponent_has_queen,
-            ));
-        }
-        for sq in added_bb {
-            added.push(k32q2::make_index(
-                perspective,
-                sq,
-                pos.piece_on(sq),
-                ksq,
-                opponent_has_queen,
-            ));
-        }
-    }
 
     entry.piece_bb = pos.pieces();
     entry.pieces = *pos.piece_array();
@@ -1253,24 +1438,16 @@ fn update_accumulator_refresh_cache(
     let entry_acc = entry.accumulation.as_mut_ptr();
     let to_acc = accumulator.accumulation[p].as_mut_ptr();
 
-    let mut entry_removed = PsqWeightRows::new();
-    let mut entry_added = PsqWeightRows::new();
-    let mut active_threats = AllWeightRows::new();
-    entry_removed.append_psq(&removed, feature_transformer);
-    entry_added.append_psq(&added, feature_transformer);
-    active_threats.append_threat(&active, feature_transformer);
-
     for j in (0..DIMENSIONS).step_by(TILE_HEIGHT) {
         // SAFETY: a tile of the accumulations, and rows of the lists.
         unsafe {
             let mut acc = load_tile(j, entry_acc);
 
-            entry_removed.apply::<-1>(j, &mut acc);
-            entry_added.apply::<1>(j, &mut acc);
+            apply_psq_features(j, &mut acc, &removed, &added, psq_weights);
 
             store_tile(j, entry_acc, &acc);
 
-            active_threats.apply::<1>(j, &mut acc);
+            apply_threat_features::<1>(j, &mut acc, &active, feature_transformer);
 
             store_tile(j, to_acc, &acc);
         }
@@ -1329,11 +1506,11 @@ mod tests {
     fn summed(ft: &FeatureTransformer, pos: &Position, perspective: Color) -> [i16; L1] {
         let mut accumulation = ft.biases.0;
         let ksq = pos.king_square(perspective);
-        let opponent_has_queen = pos.pieces_cpt(!perspective, QUEEN).any();
+        let psq_block = k32h3::block_of(pos, perspective);
         for sq in pos.pieces() {
-            let index =
-                k32q2::make_index(perspective, sq, pos.piece_on(sq), ksq, opponent_has_queen);
-            let row = in_accumulation_order(&ft.weights.0[usize::from(index) * L1..][..L1]);
+            let index = k32h3::make_index(perspective, sq, pos.piece_on(sq), ksq);
+            let row =
+                in_accumulation_order(&ft.psq_weights(psq_block)[usize::from(index) * L1..][..L1]);
             for (value, &weight) in accumulation.iter_mut().zip(&row) {
                 *value = value.wrapping_add(i16::from(weight));
             }
@@ -1424,7 +1601,7 @@ mod tests {
                     for &m in &moves {
                         if rng.rand64().is_multiple_of(4) {
                             let gives_check = pos.gives_check(m);
-                            pos.do_move(m, gives_check, stack.push());
+                            pos.do_move(m, gives_check, stack.push(&pos));
                             check(&mut stack, &pos);
                             pos.undo_move(m);
                             stack.pop();
@@ -1432,14 +1609,14 @@ mod tests {
                     }
                     let m = moves.as_slice()[(rng.rand64() % moves.len() as u64) as usize];
                     let gives_check = pos.gives_check(m);
-                    pos.do_move(m, gives_check, stack.push());
+                    pos.do_move(m, gives_check, stack.push(&pos));
                 }
             }
         }
     }
 
     #[test]
-    fn queens_taken_or_made_update_both_sides() {
+    fn heavy_pieces_taken_or_made_update_both_sides() {
         let mut rng = Prng::new(20261014);
         let network = random_network(&mut rng);
         let ft = &network.feature_transformer;
@@ -1447,8 +1624,10 @@ mod tests {
         let mut stack = AccumulatorStack::new();
 
         // Each position is evaluated after the one before it, so that the
-        // king taking the queen among 31 pieces would update by the hybrid
-        // path but for the queen, and the king's return does.
+        // king taking the queen among 31 pieces, or the last rook among 26,
+        // would update by the hybrid path but for the piece-square blocks
+        // that change, and the king's return does. Queens, and the last
+        // rooks or queens, taken or made change the blocks.
         for (fen, line) in [
             (
                 "rnb1kbnr/pppp1ppp/8/4p3/8/5P2/PPPPPqPP/RNBQKBNR w KQkq - 0 3",
@@ -1462,6 +1641,14 @@ mod tests {
                 "8/1P6/8/3k4/8/8/6p1/4K3 w - - 0 1",
                 "b7b8q g2g1q e1e2 g1b1 b8b1",
             ),
+            (
+                "4k3/1P6/8/8/8/8/1p2r3/4K3 w - - 0 1",
+                "e1e2 b2b1r b7b8q b1b8 e2d3",
+            ),
+            (
+                "1nb1kbn1/pppppppp/8/8/8/8/PPPPPrPP/1NB1KBN1 w - - 0 1",
+                "e1f2 b8c6 f2e1",
+            ),
         ] {
             let mut pos = Position::from_fen(fen, false).unwrap();
             stack.reset();
@@ -1470,7 +1657,7 @@ mod tests {
                 let m = crate::uci::to_move(&pos, uci);
                 assert!(m != Move::none(), "{uci} in {}", pos.fen());
                 let gives_check = pos.gives_check(m);
-                pos.do_move(m, gives_check, stack.push());
+                pos.do_move(m, gives_check, stack.push(&pos));
                 stack.evaluate(&pos, ft, &mut caches);
                 for perspective in [WHITE, BLACK] {
                     let accumulation = &stack.latest().accumulation[perspective.idx()];
@@ -1497,6 +1684,135 @@ mod tests {
             }
             assert_eq!(get_changed_pieces(&old, &new), Bitboard(mask));
             assert_eq!(get_changed_pieces_scalar(&old, &new), Bitboard(mask));
+        }
+    }
+
+    /// Rows applied by sign with an odd one held back, and the rows held
+    /// back then, add up as the rows applied one at a time do, for up to
+    /// three piece-square and threat rows of each sign, with weights over
+    /// their whole range: with paired widening, the held-back rows go in one
+    /// difference, whose bias must cancel without saturating.
+    #[test]
+    fn rows_held_back_add_up_as_single_rows() {
+        const ROWS: u16 = 4;
+        fn weights(rng: &mut Prng) -> Vec<i8> {
+            (0..usize::from(ROWS) * DIMENSIONS)
+                .map(|i| match i % 5 {
+                    0 => i8::MIN,
+                    1 => i8::MAX,
+                    _ => rng.rand64() as i8,
+                })
+                .collect()
+        }
+        let mut rng = Prng::new(20261107);
+        let psq_weights = weights(&mut rng);
+        let thr_weights = weights(&mut rng);
+        let start: Vec<i16> = (0..DIMENSIONS).map(|_| rng.rand64() as i16).collect();
+        let first = |n: usize| (0..n as u16).collect::<Vec<u16>>();
+        let last = |n: usize| (0..n as u16).map(|i| ROWS - 1 - i).collect::<Vec<u16>>();
+
+        for counts in 0..4 * 4 * 4 * 4 {
+            let [pr, tr, pa, ta] = [0, 1, 2, 3].map(|k| (counts >> (2 * k)) & 3);
+            let (psq_removed, thr_removed) = (first(pr), first(tr));
+            let (psq_added, thr_added) = (last(pa), last(ta));
+            let mut expected = start.clone();
+            let mut held_back = start.clone();
+            let mut incremental = start.clone();
+            let mut changed = start.clone();
+            for j in (0..DIMENSIONS).step_by(TILE_HEIGHT) {
+                // SAFETY: tiles of the accumulations and of the weights'
+                // rows, which the lists index.
+                unsafe {
+                    let psq = psq_weights.as_ptr().add(j);
+                    let thr = thr_weights.as_ptr().add(j);
+                    let row = |base: *const i8, i: u16| base.add(usize::from(i) * DIMENSIONS);
+
+                    let mut acc = load_tile(j, expected.as_ptr());
+                    for (rows, base, sign) in [
+                        (&psq_removed, psq, -1),
+                        (&thr_removed, thr, -1),
+                        (&psq_added, psq, 1),
+                        (&thr_added, thr, 1),
+                    ] {
+                        for &i in rows {
+                            if sign == 1 {
+                                apply_feature_single::<1>(&mut acc, row(base, i));
+                            } else {
+                                apply_feature_single::<-1>(&mut acc, row(base, i));
+                            }
+                        }
+                    }
+                    store_tile(j, expected.as_mut_ptr(), &acc);
+
+                    let mut acc = load_tile(j, held_back.as_ptr());
+                    let removed = apply_features_but_odd::<-1, [u16]>(
+                        j,
+                        &mut acc,
+                        &psq_removed,
+                        &thr_removed,
+                        psq,
+                        thr,
+                    );
+                    let added = apply_features_but_odd::<1, [u16]>(
+                        j, &mut acc, &psq_added, &thr_added, psq, thr,
+                    );
+                    apply_odd_features(&mut acc, removed, added);
+                    store_tile(j, held_back.as_mut_ptr(), &acc);
+
+                    // An incremental update changes one or two piece-square
+                    // rows of each sign, whose addresses it finds once.
+                    if (1..=2).contains(&pr) && (1..=2).contains(&pa) {
+                        let base = psq_weights.as_ptr();
+                        let rows =
+                            |list: &[u16]| [row(base, list[0]), row(base, *list.last().unwrap())];
+                        let mut acc = load_tile(j, incremental.as_ptr());
+                        let removed = if pr == 1 {
+                            let rows: [*const i8; 1] = [rows(&psq_removed)[0]];
+                            apply_features_but_odd::<-1, _>(
+                                j,
+                                &mut acc,
+                                &rows,
+                                &thr_removed,
+                                psq,
+                                thr,
+                            )
+                        } else {
+                            let rows = rows(&psq_removed);
+                            apply_features_but_odd::<-1, _>(
+                                j,
+                                &mut acc,
+                                &rows,
+                                &thr_removed,
+                                psq,
+                                thr,
+                            )
+                        };
+                        let added = if pa == 1 {
+                            let rows: [*const i8; 1] = [rows(&psq_added)[0]];
+                            apply_features_but_odd::<1, _>(j, &mut acc, &rows, &thr_added, psq, thr)
+                        } else {
+                            let rows = rows(&psq_added);
+                            apply_features_but_odd::<1, _>(j, &mut acc, &rows, &thr_added, psq, thr)
+                        };
+                        apply_odd_features(&mut acc, removed, added);
+                        store_tile(j, incremental.as_mut_ptr(), &acc);
+                    }
+
+                    if tr == 0 && ta == 0 {
+                        let mut acc = load_tile(j, changed.as_ptr());
+                        apply_changed_features(&mut acc, &psq_removed, &psq_added, psq);
+                        store_tile(j, changed.as_mut_ptr(), &acc);
+                    }
+                }
+            }
+            let rows = format!("{pr} {tr} {pa} {ta}");
+            assert_eq!(held_back, expected, "{rows}");
+            if (1..=2).contains(&pr) && (1..=2).contains(&pa) {
+                assert_eq!(incremental, expected, "{rows}");
+            }
+            if tr == 0 && ta == 0 {
+                assert_eq!(changed, expected, "{rows}");
+            }
         }
     }
 }

@@ -18,29 +18,32 @@ use crate::bitboard::square_bb;
 use crate::movepick::AtomicMovePicker;
 use crate::variant::Atomic;
 
-// Search parameters that Atomic-Stockfish's SPSA campaigns tuned
+// Search parameters: Atomic-Stockfish's SPSA campaigns tuned them, and
+// varifish's SPSA retuned them for its own search. The small ones are
+// held in sixteenths, so that a tuning can move them by less than one.
 
-/// Fairy-Stockfish's move-count pruning for blast variants
-const ATOMIC_MCP_BASE: i32 = 7;
+/// Fairy-Stockfish's move-count pruning for blast variants, in sixteenths
+const ATOMIC_MCP_BASE: i32 = 132;
 /// A null move reduction a ply shallower than Stockfish's, since Atomic's
-/// threats make a null move's cutoff less trustworthy
-const ATOMIC_NMP_BASE: Depth = 6;
-const ATOMIC_NMP_DEPTH_DIV: Depth = 4;
+/// threats make a null move's cutoff less trustworthy; both in sixteenths
+const ATOMIC_NMP_BASE: Depth = 110;
+const ATOMIC_NMP_DEPTH_DIV: Depth = 59;
 /// Atomic's futility margins out of 64 of Stockfish's: material swings by
 /// whole clusters of pieces
-const ATOMIC_FUTILITY_SCALE: i32 = 128;
-const ATOMIC_CAPT_FUT_BASE: i32 = 227;
-const ATOMIC_CAPT_FUT_LMR_MULT: i32 = 244;
-const QS_FUTILITY_BASE: i32 = 345;
+const ATOMIC_FUTILITY_SCALE: i32 = 122;
+const ATOMIC_CAPT_FUT_BASE: i32 = 226;
+const ATOMIC_CAPT_FUT_LMR_MULT: i32 = 245;
+const QS_FUTILITY_BASE: i32 = 337;
 const SINGULAR_DEPTH_MIN: Depth = 8;
 const SINGULAR_MARGIN_BASE: i32 = 65;
 const SINGULAR_MARGIN_TT_PV: i32 = 83;
 const SINGULAR_MARGIN_DIV: i32 = 48;
 /// The scale of the reductions table, out of 128
-pub(super) const LMR_LOG_SCALE: i32 = 2736;
+pub(super) const LMR_LOG_SCALE: i32 = 2745;
 /// Atomic-Stockfish's 1049, less the 34 by which Stockfish's 885813b0
-/// lowered its offset when it dropped the reductions' window term
-const LMR_BASE_OFFSET: i32 = 1015;
+/// lowered its offset when it dropped the reductions' window term, and as
+/// varifish's SPSA retuned it
+const LMR_BASE_OFFSET: i32 = 1008;
 
 /// Atomic-Stockfish's time management, which forked Stockfish's before its
 /// latest tuning
@@ -61,12 +64,12 @@ pub(super) const TIME: TimeConstants = TimeConstants {
 /// pruning them earlier than chess does.
 #[inline(always)]
 fn move_count_pruning_threshold(improving: bool, depth: Depth) -> i32 {
-    (ATOMIC_MCP_BASE + depth * depth) / (3 - improving as i32)
+    (ATOMIC_MCP_BASE + 16 * depth * depth) / (16 * (3 - improving as i32))
 }
 
 #[inline(always)]
 fn null_move_reduction(depth: Depth) -> Depth {
-    ATOMIC_NMP_BASE + depth / ATOMIC_NMP_DEPTH_DIV
+    (ATOMIC_NMP_BASE * ATOMIC_NMP_DEPTH_DIV + 256 * depth) / (16 * ATOMIC_NMP_DEPTH_DIV)
 }
 
 /// Whether futility may prune a capture by the value of the captured piece
@@ -324,7 +327,7 @@ impl Worker<Atomic> {
         }
         if prior_reduction >= 2
             && depth >= 2
-            && self.stack[ss].static_eval + self.stack[ss - 1].static_eval > 173
+            && self.stack[ss].static_eval + self.stack[ss - 1].static_eval > 167
         {
             depth -= 1;
         }
@@ -348,7 +351,7 @@ impl Worker<Atomic> {
             if tt_data.mv != Move::none() && tt_data.value >= beta {
                 // Bonus for a quiet ttMove that fails high
                 if !tt_capture {
-                    self.atomic_update_quiet_histories(sh, pos, ss, tt_data.mv, 131 * depth);
+                    self.atomic_update_quiet_histories(sh, pos, ss, tt_data.mv, 126 * depth);
                 }
 
                 // Extra penalty for early quiet moves of the previous ply
@@ -358,7 +361,7 @@ impl Worker<Atomic> {
                         ss - 1,
                         pos.piece_on(prev_sq),
                         prev_sq,
-                        -2187,
+                        -2223,
                     );
                 }
             }
@@ -492,16 +495,16 @@ impl Worker<Atomic> {
             // Use static evaluation difference to improve quiet move ordering
             if prev_move.is_ok() && !self.stack[ss - 1].in_check && !prior_capture {
                 let eval_diff = (-(self.stack[ss - 1].static_eval + self.stack[ss].static_eval))
-                    .clamp(-183, 180)
-                    + 62;
+                    .clamp(-189, 184)
+                    + 64;
                 self.hist.main_history[(!us).idx()][prev_move.raw() as usize]
-                    .update(eval_diff * 10);
+                    .update(eval_diff * 164 / 16);
                 if !tt_hit
                     && pos.piece_on(prev_sq).type_of() != PAWN
                     && prev_move.type_of() != PROMOTION
                 {
                     sh.histories.pawn_entry(pos)[pos.piece_on(prev_sq).idx()][prev_sq.idx()]
-                        .update(eval_diff * 13);
+                        .update(eval_diff * 219 / 16);
                 }
             }
 
@@ -510,7 +513,7 @@ impl Worker<Atomic> {
             // qsearch value. The margin is master's at Atomic's futility
             // scale.
             if all_node
-                && eval < alpha - 342 * depth * ATOMIC_FUTILITY_SCALE / 64
+                && eval < alpha - 336 * depth * ATOMIC_FUTILITY_SCALE / 64
                 && !self.seek_mate
             {
                 return self.atomic_qsearch::<NON_PV>(sh, pos, ss, alpha, beta);
@@ -529,24 +532,24 @@ impl Worker<Atomic> {
                 && !is_win(eval)
                 && !pos.atomic_under_blast_threat()
             {
-                let mut futility_mult = (40 + depth * 4).min(80);
+                let mut futility_mult = (37 + depth * 62 / 16).min(78);
                 futility_mult -= 20 * (!self.stack[ss].tt_hit) as i32;
                 futility_mult = futility_mult * ATOMIC_FUTILITY_SCALE / 64;
 
                 let futility_margin = futility_mult * depth
-                    - (2934 * improving as i32 + 343 * opponent_worsening as i32) * futility_mult
+                    - (2935 * improving as i32 + 340 * opponent_worsening as i32) * futility_mult
                         / 1024
-                    + correction_value.abs() / 182069;
+                    + correction_value.abs() / 185033;
 
                 if eval - futility_margin >= beta {
-                    return (716 * beta + 308 * eval) / 1024;
+                    return (699 * beta + (1024 - 699) * eval) / 1024;
                 }
             }
 
             // Step 9. Null move search with verification search
             if cut_node
-                && self.stack[ss].static_eval + 50 * self.stack[ss].prior_nmp_fail_high
-                    >= beta - 14 * depth - 45 * improving as i32 + 374
+                && self.stack[ss].static_eval + 47 * self.stack[ss].prior_nmp_fail_high
+                    >= beta - 14 * depth - 44 * improving as i32 + 372
                 && excluded_move == Move::none()
                 && pos.non_pawn_material(us) != 0
                 && ply >= self.nmp_min_ply
@@ -555,9 +558,11 @@ impl Worker<Atomic> {
                 debug_assert!(self.stack[ss - 1].current_move != Move::null());
 
                 // Atomic-Stockfish's reduction, and a ply more for each 256
-                // of static evaluation over beta
-                let mut r =
-                    null_move_reduction(depth) + ((self.stack[ss].static_eval - beta) / 256).max(0);
+                // of static evaluation over beta. Odd threads reduce one ply
+                // less, as Stockfish's do.
+                let mut r = null_move_reduction(depth)
+                    + ((self.stack[ss].static_eval - beta) / 258).max(0)
+                    - (self.thread_idx & 1) as i32;
                 r -= self.seek_mate as i32 * r / 2;
                 self.do_null_move(pos, ss);
 
@@ -612,7 +617,7 @@ impl Worker<Atomic> {
             // If we have a good enough capture (or queen promotion) and a
             // reduced search returns a value much above beta, we can
             // (almost) safely prune the previous move.
-            let prob_cut_beta = beta + 214 - 59 * improving as i32;
+            let prob_cut_beta = beta + 215 - 60 * improving as i32;
             if depth >= 3
                 && !is_decisive(beta)
                 // If value from transposition table is lower than
@@ -695,7 +700,7 @@ impl Worker<Atomic> {
         // moves_loop: When in check, search starts here
 
         // Step 12. A small Probcut idea
-        let prob_cut_beta = beta + 428;
+        let prob_cut_beta = beta + 448;
         if (tt_data.bound & BOUND_LOWER) != 0
             && tt_data.depth >= depth - 4
             && tt_data.value >= prob_cut_beta
@@ -782,7 +787,7 @@ impl Worker<Atomic> {
 
             // Decrease reduction for PvNodes
             if pv_node {
-                r -= 512;
+                r -= 530;
             }
 
             // Increase reduction for ttPv nodes (*Scaler)
@@ -814,7 +819,7 @@ impl Worker<Atomic> {
                             + ATOMIC_CAPT_FUT_BASE
                             + ATOMIC_CAPT_FUT_LMR_MULT * lmr_depth
                             + captured_piece.value()
-                            + 131 * capt_hist / 1024;
+                            + 133 * capt_hist / 1024;
 
                         if futility_value <= alpha {
                             continue;
@@ -824,7 +829,7 @@ impl Worker<Atomic> {
                     // SEE based pruning for captures and checks
                     // Avoid pruning sacrifices of our last piece for
                     // stalemate
-                    let margin = 175 * depth + capt_hist * 34 / 1024;
+                    let margin = 178 * depth + capt_hist * 33 / 1024;
                     if (alpha >= VALUE_DRAW || pos.non_pawn_material(us) != moved_piece.value())
                         && !pos.see_ge(mv, -margin)
                     {
@@ -836,7 +841,7 @@ impl Worker<Atomic> {
                         + sh.histories.pawn_entry(pos)[moved_piece.idx()][mv.to_sq().idx()].get();
 
                     // Continuation history based pruning
-                    if history < -4313 * depth {
+                    if history < -4207 * depth {
                         continue;
                     }
 
@@ -856,10 +861,7 @@ impl Worker<Atomic> {
                     // (*Scaler): Generally, more frequent futility pruning
                     // scales well
                     if !self.stack[ss].in_check && lmr_depth < 12 && futility_value <= alpha {
-                        if best_value <= futility_value
-                            && !is_decisive(best_value)
-                            && !is_win(futility_value)
-                        {
+                        if best_value <= futility_value && !is_win(futility_value) {
                             best_value = futility_value;
                         }
                         continue;
@@ -868,7 +870,7 @@ impl Worker<Atomic> {
                     lmr_depth = lmr_depth.max(0);
 
                     // Prune moves with negative SEE
-                    if !pos.see_ge(mv, -25 * lmr_depth * lmr_depth) {
+                    if !pos.see_ge(mv, -26 * lmr_depth * lmr_depth) {
                         continue;
                     }
                 }
@@ -941,10 +943,10 @@ impl Worker<Atomic> {
                 // moves fail high), and we can prune the whole subtree by
                 // returning a softbound.
                 else if value >= beta && !is_decisive(value) {
-                    self.tt_move_history.update(-442 - 108 * depth);
+                    self.tt_move_history.update(-438 - 114 * depth);
 
                     if !self.stack[ss].in_check && value > self.stack[ss].static_eval {
-                        let bonus = ((value - self.stack[ss].static_eval) * 664 / 1024)
+                        let bonus = ((value - self.stack[ss].static_eval) * 637 / 1024)
                             .clamp(-CORRECTION_HISTORY_LIMIT / 4, CORRECTION_HISTORY_LIMIT / 4);
                         self.atomic_update_correction_history(sh, pos, ss, bonus);
                     }
@@ -983,34 +985,34 @@ impl Worker<Atomic> {
             }
 
             // Base reduction offset to compensate for other tweaks
-            r += 714;
-            r -= move_count * 62;
-            r -= correction_value.abs() / 26131;
+            r += 728;
+            r -= move_count * 61;
+            r -= correction_value.abs() / 26490;
 
             // Increase reduction for cut nodes
             if cut_node {
-                r += 3995 + 1059 * (tt_data.mv == Move::none()) as i32;
+                r += 3809 + 1068 * (tt_data.mv == Move::none()) as i32;
             }
 
             // Increase reduction if ttMove is a capture
             if tt_capture {
-                r += 1039;
+                r += 1001;
             }
 
             // Increase reduction if next ply has a lot of fail high
             if self.stack[ss + 1].cutoff_cnt > 1 {
-                r += 236
-                    + 1079 * (self.stack[ss + 1].cutoff_cnt > 2) as i32
-                    + 1143 * all_node as i32;
+                r += 245
+                    + 1112 * (self.stack[ss + 1].cutoff_cnt > 2) as i32
+                    + 1134 * all_node as i32;
             }
             // For first picked move (ttMove) reduce reduction
             else if mv == tt_data.mv {
-                r -= 2016;
+                r -= 1961;
             }
 
             if capture {
                 let captured = pos.captured_piece();
-                self.stack[ss].stat_score = 809 * captured.value() / 128
+                self.stack[ss].stat_score = 796 * captured.value() / 128
                     + self.hist.capture_history[moved_piece.idx()][mv.to_sq().idx()]
                         [captured.type_of().idx()]
                     .get();
@@ -1022,16 +1024,16 @@ impl Worker<Atomic> {
             }
 
             // Decrease/increase reduction for moves with a good/bad history
-            r -= self.stack[ss].stat_score * 445 / 4096;
+            r -= self.stack[ss].stat_score * 460 / 4096;
 
             // The evaluation's gap to alpha at Atomic's futility scale
             if !capture && !is_decisive(alpha) {
-                r += 3 * ((alpha - eval) * 64 / ATOMIC_FUTILITY_SCALE).clamp(-64, 96);
+                r += 186 * ((alpha - eval) * 64 / ATOMIC_FUTILITY_SCALE).clamp(-63, 93) / 64;
             }
 
             // Scale up reductions for expected ALL nodes
             if all_node {
-                r += r * 272 / (256 * depth + 285);
+                r += r * 275 / (253 * depth + 287);
             }
 
             // When seeking a mate, reduce non-checking moves more and
@@ -1086,7 +1088,7 @@ impl Worker<Atomic> {
                         ss,
                         moved_piece,
                         mv.to_sq(),
-                        1415,
+                        1442,
                     );
                 }
             }
@@ -1094,7 +1096,7 @@ impl Worker<Atomic> {
             else if !pv_node || move_count > 1 {
                 // Increase reduction if ttMove is not present
                 if tt_data.mv == Move::none() {
-                    r += 1085;
+                    r += 1110;
                 }
 
                 // Note that if expected reduction is high, we reduce search
@@ -1105,7 +1107,7 @@ impl Worker<Atomic> {
                     ss + 1,
                     -(alpha + 1),
                     -alpha,
-                    new_depth - (r > 5039) as i32 - (r > 5223 && new_depth > 2) as i32,
+                    new_depth - (r > 5123) as i32 - (r > 5246 && new_depth > 2) as i32,
                     !cut_node,
                 );
             }
@@ -1315,31 +1317,30 @@ impl Worker<Atomic> {
                 &captures_searched,
                 depth,
                 tt_data.mv,
-                pv_node,
             );
             if !pv_node {
                 self.tt_move_history
-                    .update(if best_move == tt_data.mv { 792 } else { -779 });
+                    .update(if best_move == tt_data.mv { 785 } else { -758 });
             }
         }
         // Bonus for prior quiet countermove that caused the fail low
         else if !prior_capture && prev_sq != Square::NONE {
-            let mut bonus_scale = -245;
-            bonus_scale -= self.stack[ss - 1].stat_score / 98;
-            bonus_scale += (59 * depth).min(430);
-            bonus_scale += 191 * (self.stack[ss - 1].move_count > 8) as i32;
-            bonus_scale += 143
-                * (!self.stack[ss].in_check && best_value <= self.stack[ss].static_eval - 103)
+            let mut bonus_scale = -228;
+            bonus_scale -= self.stack[ss - 1].stat_score / 93;
+            bonus_scale += (56 * depth).min(451);
+            bonus_scale += 192 * (self.stack[ss - 1].move_count > 8) as i32;
+            bonus_scale += 144
+                * (!self.stack[ss].in_check && best_value <= self.stack[ss].static_eval - 105)
                     as i32;
-            bonus_scale += 151
+            bonus_scale += 149
                 * (!self.stack[ss - 1].in_check
-                    && best_value <= -self.stack[ss - 1].static_eval - 78) as i32;
+                    && best_value <= -self.stack[ss - 1].static_eval - 79) as i32;
 
             bonus_scale = bonus_scale.max(0);
 
             // scaledBonus ranges from 0 to roughly 2.3M, overflows happen for
             // multipliers larger than 900
-            let scaled_bonus = (141 * depth - 82).min(1472) * bonus_scale;
+            let scaled_bonus = (134 * depth - 83).min(1495) * bonus_scale;
 
             self.atomic_update_continuation_histories(
                 sh,
@@ -1350,11 +1351,11 @@ impl Worker<Atomic> {
             );
 
             self.hist.main_history[(!us).idx()][prev_move.raw() as usize]
-                .update(scaled_bonus * 234 / 32768);
+                .update(scaled_bonus * 219 / 32768);
 
             if pos.piece_on(prev_sq).type_of() != PAWN && prev_move.type_of() != PROMOTION {
                 sh.histories.pawn_entry(pos)[pos.piece_on(prev_sq).idx()][prev_sq.idx()]
-                    .update(scaled_bonus * 322 / 8192);
+                    .update(scaled_bonus * 304 / 8192);
             }
         }
         // Bonus for prior capture countermove that caused the fail low, for
@@ -1366,7 +1367,7 @@ impl Worker<Atomic> {
             debug_assert!(captured_piece != NO_PIECE);
             let pc = self.prior_piece(pos, ss);
             self.hist.capture_history[pc.idx()][prev_sq.idx()][captured_piece.type_of().idx()]
-                .update(901);
+                .update(950);
         }
 
         if pv_node {
@@ -1413,10 +1414,10 @@ impl Worker<Atomic> {
         {
             let bonus = ((best_value - self.stack[ss].static_eval)
                 * depth
-                * if best_move != Move::none() { 12 } else { 18 }
+                * if best_move != Move::none() { 11 } else { 18 }
                 / 128)
                 .clamp(-CORRECTION_HISTORY_LIMIT / 4, CORRECTION_HISTORY_LIMIT / 4);
-            self.atomic_update_correction_history(sh, pos, ss, 1114 * bonus / 1024);
+            self.atomic_update_correction_history(sh, pos, ss, 1071 * bonus / 1024);
         }
 
         debug_assert!(-VALUE_INFINITE < best_value && best_value < VALUE_INFINITE);
@@ -1585,7 +1586,7 @@ impl Worker<Atomic> {
                 }
 
                 if !is_decisive(best_value) {
-                    best_value = (467 * best_value + 557 * beta) / 1024;
+                    best_value = (464 * best_value + (1024 - 464) * beta) / 1024;
                 }
 
                 if !self.stack[ss].tt_hit {
@@ -1690,7 +1691,7 @@ impl Worker<Atomic> {
                 }
 
                 // Do not search moves with bad enough SEE values
-                if !pos.see_ge(mv, -74) {
+                if !pos.see_ge(mv, -72) {
                     continue;
                 }
             }
@@ -1741,7 +1742,7 @@ impl Worker<Atomic> {
         }
 
         if !is_decisive(best_value) && best_value > beta {
-            best_value = (481 * best_value + 543 * beta) / 1024;
+            best_value = (464 * best_value + (1024 - 464) * beta) / 1024;
         }
 
         // Save gathered info in transposition table. The static evaluation
@@ -1792,28 +1793,29 @@ impl Worker<Atomic> {
     /// the 10% by which Stockfish's 7a372f3f made room for the sixth ply.
     #[inline(always)]
     fn atomic_correction_value(&self, sh: &SharedState, pos: &Position<Atomic>, ss: usize) -> i32 {
-        let us = pos.side_to_move().idx();
         let m = self.stack[ss - 1].current_move;
         let shared = &sh.histories;
-        let pcv = shared.pawn_correction_entry(pos)[us].pawn.get();
-        let micv = shared.minor_piece_correction_entry(pos)[us].minor.get();
-        let wnpcv = shared.nonpawn_correction_entry(pos, WHITE)[us]
+        let pcv = shared.pawn_correction_entry(pos).pawn.get();
+        let micv = shared.minor_piece_correction_entry(pos).minor.get();
+        let wnpcv = shared
+            .nonpawn_correction_entry(pos, WHITE)
             .non_pawn_white
             .get();
-        let bnpcv = shared.nonpawn_correction_entry(pos, BLACK)[us]
+        let bnpcv = shared
+            .nonpawn_correction_entry(pos, BLACK)
             .non_pawn_black
             .get();
         let cntcv = if m.is_ok() {
             let to = m.to_sq();
             let pc = self.prior_piece(pos, ss);
-            7527 * (self.continuation_correction(ss - 2, pc, to).get()
+            7752 * (self.continuation_correction(ss - 2, pc, to).get()
                 + self.continuation_correction(ss - 4, pc, to).get())
-                + 6021 * self.continuation_correction(ss - 6, pc, to).get()
+                + 5686 * self.continuation_correction(ss - 6, pc, to).get()
         } else {
-            81325
+            82882
         };
 
-        12011 * pcv + 8352 * micv + 10656 * (wnpcv + bnpcv) + cntcv
+        12291 * pcv + 8375 * micv + 10709 * (wnpcv + bnpcv) + cntcv
     }
 
     fn atomic_update_correction_history(
@@ -1824,26 +1826,28 @@ impl Worker<Atomic> {
         bonus: i32,
     ) {
         let m = self.stack[ss - 1].current_move;
-        let us = pos.side_to_move().idx();
 
-        const NON_PAWN_WEIGHT: i32 = 186;
+        let non_pawn_weight = 191;
         let shared = &sh.histories;
 
-        shared.pawn_correction_entry(pos)[us].pawn.update(bonus);
-        shared.minor_piece_correction_entry(pos)[us]
+        shared.pawn_correction_entry(pos).pawn.update(bonus);
+        shared
+            .minor_piece_correction_entry(pos)
             .minor
-            .update(bonus * 152 / 128);
-        shared.nonpawn_correction_entry(pos, WHITE)[us]
+            .update(bonus * 153 / 128);
+        shared
+            .nonpawn_correction_entry(pos, WHITE)
             .non_pawn_white
-            .update(bonus * NON_PAWN_WEIGHT / 128);
-        shared.nonpawn_correction_entry(pos, BLACK)[us]
+            .update(bonus * non_pawn_weight / 128);
+        shared
+            .nonpawn_correction_entry(pos, BLACK)
             .non_pawn_black
-            .update(bonus * NON_PAWN_WEIGHT / 128);
+            .update(bonus * non_pawn_weight / 128);
 
         if m.is_ok() {
             let to = m.to_sq();
             let pc = self.prior_piece(pos, ss);
-            for (i, weight) in [(2, 136), (4, 68), (6, 34)] {
+            for (i, weight) in [(2, 135), (4, 67), (6, 33)] {
                 let index = self.stack[ss - i].continuation_correction_history as usize;
                 self.hist.continuation_correction_history[index & (PIECE_NB * SQUARE_NB - 1)]
                     [pc.idx()][to.idx()]
@@ -1865,29 +1869,26 @@ impl Worker<Atomic> {
         captures_searched: &SearchedList,
         depth: Depth,
         tt_move: Move,
-        pv_node: bool,
     ) {
         let moved_piece = pos.moved_piece(best_move);
 
-        let mut bonus = (134 * depth - 79).min(1572)
-            + 382 * (best_move == tt_move) as i32
+        let mut bonus = (138 * depth - 83).min(1561)
+            + 395 * (best_move == tt_move) as i32
             + self.stack[ss - 1].stat_score / 30;
-        let malus = (1005 * depth - 205).min(2218);
+        let malus = (1023 * depth - 203).min(2318);
 
-        if !pv_node {
-            // Atomic-Stockfish multiplies in unsigned 64-bit arithmetic,
-            // which amounts to rounding the quotient down.
-            let searched = (quiets_searched.len() + captures_searched.len()) as i64;
-            bonus += (i64::from(bonus) * searched).div_euclid(256) as i32;
-        }
+        // Atomic-Stockfish multiplies in unsigned 64-bit arithmetic, which
+        // amounts to rounding the quotient down.
+        let searched = (quiets_searched.len() + captures_searched.len()) as i64;
+        bonus += (i64::from(bonus) * searched).div_euclid(252) as i32;
 
         if !pos.capture_stage(best_move) {
-            self.atomic_update_quiet_histories(sh, pos, ss, best_move, bonus * 824 / 1024);
+            self.atomic_update_quiet_histories(sh, pos, ss, best_move, bonus * 837 / 1024);
 
             // Decrease stats for all non-best quiet moves
-            let mut actual_malus = malus * 1136 / 1024;
+            let mut actual_malus = malus * 1222 / 1024;
             for &mv in quiets_searched {
-                actual_malus = actual_malus * 956 / 1024;
+                actual_malus = actual_malus * 962 / 1024;
                 self.atomic_update_quiet_histories(sh, pos, ss, mv, -actual_malus);
             }
         } else {
@@ -1895,7 +1896,7 @@ impl Worker<Atomic> {
             let captured_piece = pos.piece_on(best_move.to_sq()).type_of();
             self.hist.capture_history[moved_piece.idx()][best_move.to_sq().idx()]
                 [captured_piece.idx()]
-            .update(bonus * 1366 / 1024);
+            .update(bonus * 1419 / 1024);
         }
 
         // Extra penalty for a quiet early move that was not a TT move in
@@ -1909,7 +1910,7 @@ impl Worker<Atomic> {
                 ss - 1,
                 pos.piece_on(prev_sq),
                 prev_sq,
-                -malus * 683 / 1024,
+                -malus * 673 / 1024,
             );
         }
 
@@ -1918,7 +1919,7 @@ impl Worker<Atomic> {
             let moved_piece = pos.moved_piece(mv);
             let captured_piece = pos.piece_on(mv.to_sq()).type_of();
             self.hist.capture_history[moved_piece.idx()][mv.to_sq().idx()][captured_piece.idx()]
-                .update(-malus * 1518 / 1024);
+                .update(-malus * 1472 / 1024);
         }
     }
 
@@ -1933,10 +1934,10 @@ impl Worker<Atomic> {
         bonus: i32,
     ) {
         const CONTHIST_BONUSES: [(usize, i32); 5] =
-            [(1, 1040), (2, 780), (3, 300), (4, 537), (6, 423)];
+            [(1, 990), (2, 737), (3, 303), (4, 549), (6, 420)];
 
         // Multipliers for positive history consistency
-        const CMHC_MULTIPLIERS: [i32; 6] = [96, 113, 101, 105, 127, 121];
+        const CMHC_MULTIPLIERS: [i32; 6] = [100, 108, 101, 107, 131, 119];
 
         // Each weight times each multiplier, so that a bonus takes one
         // multiplication, in 64 bits: in the 32 that Atomic-Stockfish
@@ -1973,7 +1974,7 @@ impl Worker<Atomic> {
                 }
 
                 let product = bonus * WEIGHTED[k][positive_count];
-                history_entry.update((product / 131072) as i32 + 71 * (i < 2) as i32);
+                history_entry.update((product / 131072) as i32 + 69 * (i < 2) as i32);
             }
         }
     }
@@ -1993,7 +1994,7 @@ impl Worker<Atomic> {
 
         let ply = ply_of(ss);
         if (ply as usize) < LOW_PLY_HISTORY_SIZE {
-            self.hist.low_ply_history[ply as usize][mv.raw() as usize].update(bonus * 663 / 1024);
+            self.hist.low_ply_history[ply as usize][mv.raw() as usize].update(bonus * 631 / 1024);
         }
 
         self.atomic_update_continuation_histories(
@@ -2001,10 +2002,10 @@ impl Worker<Atomic> {
             ss,
             pos.moved_piece(mv),
             mv.to_sq(),
-            bonus * 820 / 1024,
+            bonus * 860 / 1024,
         );
 
-        let weight = if bonus > -7 { 1038 } else { 525 };
+        let weight = if bonus > -7 { 1082 } else { 536 };
         sh.histories.pawn_entry(pos)[pos.moved_piece(mv).idx()][mv.to_sq().idx()]
             .update(bonus * weight / 1024);
     }

@@ -5,7 +5,7 @@
 //     import { start, relaxedSimd } from './varifish.js';
 //     const engine = await start({
 //       wasm: relaxedSimd() ? 'varifish-wasm32-relaxed-simd.wasm' : 'varifish-wasm32.wasm',
-//       files: { 'atomic_run3b_e202_l05.nnue': await (await fetch(url)).arrayBuffer() },
+//       files: { 'atomic-b0d279b9e021.nnue': await (await fetch(url)).arrayBuffer() },
 //       onLine: line => console.log(line),
 //     });
 //     engine.send('uci');

@@ -9,7 +9,6 @@
 use std::fmt::Write;
 
 use super::accumulator::{AccumulatorCaches, AccumulatorStack};
-use super::architecture::LAYER_STACKS;
 use super::network::Network;
 use crate::position::Position;
 use crate::types::*;
@@ -45,7 +44,7 @@ pub fn trace(pos: &Position, network: &Network, caches: &mut AccumulatorCaches) 
     ss += "|   Bucket   | Evaluation |\n";
     ss += "+------------+------------+\n";
 
-    for bucket in 0..LAYER_STACKS {
+    for bucket in 0..t.layer_stacks {
         let _ = write!(ss, "|  {bucket:<10}|  ");
         format_cp_aligned_dot(t.positional[bucket], &mut ss, pos);
         ss += "   |";

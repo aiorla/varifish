@@ -17,7 +17,7 @@ use std::ops::{Index, IndexMut};
 
 use crate::attacks::*;
 use crate::bitboard::*;
-use crate::misc::{IStream, Prng, is_space};
+use crate::misc::{IStream, Prng, ValueList, is_space};
 use crate::movegen::{ALL, GenType, MoveList, Moves};
 use crate::types::*;
 use crate::variant::{Chess, Variant};
@@ -34,8 +34,10 @@ pub struct Zobrist {
     pub psq: [[Key; SQUARE_NB]; PIECE_NB],
     pub enpassant: [Key; FILE_NB],
     pub castling: [Key; CASTLING_RIGHT_NB],
+    /// The lowest bit, which the other keys leave clear: a position's key,
+    /// pawn key, minor piece key and non-pawn keys hold the side to move
+    /// there.
     pub side: Key,
-    pub no_pawns: Key,
 }
 
 /// Stockfish's Zobrist keys, from its generator and seed, so that hash keys
@@ -47,15 +49,14 @@ pub static ZOBRIST: Zobrist = {
         psq: [[0; SQUARE_NB]; PIECE_NB],
         enpassant: [0; FILE_NB],
         castling: [0; CASTLING_RIGHT_NB],
-        side: 0,
-        no_pawns: 0,
+        side: 1,
     };
     let mut i = 0;
     while i < PIECES.len() {
         let pc = PIECES[i].0 as usize;
         let mut s = 0;
         while s < SQUARE_NB {
-            z.psq[pc][s] = rng.rand64();
+            z.psq[pc][s] = rng.rand64() << 1;
             s += 1;
         }
         i += 1;
@@ -69,43 +70,133 @@ pub static ZOBRIST: Zobrist = {
     }
     f = 0;
     while f < FILE_NB {
-        z.enpassant[f] = rng.rand64();
+        z.enpassant[f] = rng.rand64() << 1;
         f += 1;
     }
     let mut cr = 0;
     while cr < CASTLING_RIGHT_NB {
-        z.castling[cr] = rng.rand64();
+        z.castling[cr] = rng.rand64() << 1;
         cr += 1;
     }
-    z.side = rng.rand64();
-    z.no_pawns = rng.rand64();
     z
 };
 
-// Marcel van Kervinck's cuckoo tables, which detect that a reversible move
-// could repeat a position: the keys of the reversible moves of each piece
-// between two squares, and the moves themselves, hashed two ways. See
-// http://web.archive.org/web/20201107002606/https://marcelk.net/2013-04-06/paper/upcoming-rep-v2.pdf
+// No combination of the en passant and castling keys may cancel, so that a
+// matching piece placement and key guarantee the same position.
+const _: () = {
+    let mut a = 0;
+    while a < CASTLING_RIGHT_NB {
+        let mut b = a;
+        while b < CASTLING_RIGHT_NB {
+            // 0 means no en passant key.
+            let mut f1 = 0;
+            while f1 <= FILE_NB {
+                let mut f2 = f1;
+                while f2 <= FILE_NB {
+                    let cr = ZOBRIST.castling[a] ^ ZOBRIST.castling[b];
+                    let ep = (if f1 > 0 { ZOBRIST.enpassant[f1 - 1] } else { 0 })
+                        ^ (if f2 > 0 { ZOBRIST.enpassant[f2 - 1] } else { 0 });
+                    assert!(
+                        (a == b && f1 == f2) || cr ^ ep != 0,
+                        "Zobrist ep/castling keys must not cancel"
+                    );
+                    f2 += 1;
+                }
+                f1 += 1;
+            }
+            b += 1;
+        }
+        a += 1;
+    }
+};
 
-const fn h1(h: Key) -> usize {
-    (h & 0x1fff) as usize
+// The lowest bit is the side to move's, which no other key may set.
+const _: () = {
+    let mut any = 0;
+    let mut pc = 0;
+    while pc < PIECE_NB {
+        let mut s = 0;
+        while s < SQUARE_NB {
+            any |= ZOBRIST.psq[pc][s];
+            s += 1;
+        }
+        pc += 1;
+    }
+    let mut i = 0;
+    while i < CASTLING_RIGHT_NB {
+        any |= ZOBRIST.castling[i];
+        i += 1;
+    }
+    i = 0;
+    while i < FILE_NB {
+        any |= ZOBRIST.enpassant[i];
+        i += 1;
+    }
+    assert!(
+        any & ZOBRIST.side == 0 && ZOBRIST.side == 1,
+        "Least significant bit of psq, castling and ep keys must be zero"
+    );
+};
+
+/// The pieces of a board in nibbles, the lower half of the board's squares
+/// in the low nibbles and the upper half in the high ones, which tell
+/// repeated positions apart exactly where their keys could collide.
+pub type PiecePlacement = [u8; 32];
+
+#[inline(always)]
+fn pack_pieces(board: &[Piece; SQUARE_NB]) -> PiecePlacement {
+    // SAFETY: a Piece is a transparent u8.
+    let bytes: &[u8; SQUARE_NB] = unsafe { &*(board as *const [Piece; SQUARE_NB]).cast() };
+    let (low, high) = bytes.split_at(32);
+    // Two vector loads, a shift and an or, where byte by byte the lanes of
+    // the upper half were put together one at a time
+    std::array::from_fn(|i| low[i] | high[i] << 4)
 }
 
-const fn h2(h: Key) -> usize {
-    ((h >> 16) & 0x1fff) as usize
+/// Swaps the nibbles of two squares.
+#[inline(always)]
+fn swap_nibble(p: &mut PiecePlacement, s1: Square, s2: Square) {
+    let (i1, sh1) = (s1.idx() & 31, (s1.idx() & 0x20) >> 3);
+    let (i2, sh2) = (s2.idx() & 31, (s2.idx() & 0x20) >> 3);
+    let swap = ((p[i1] >> sh1) ^ (p[i2] >> sh2)) & 0xF;
+    p[i1] ^= swap << sh1;
+    p[i2] ^= swap << sh2;
 }
 
-struct Cuckoo {
-    keys: [Key; 8192],
-    moves: [Move; 8192],
+// A Robin Hood table of the keys of the reversible moves of each piece
+// between two squares, and of the moves themselves, for Marcel van
+// Kervinck's detection of a reversible move that could repeat a position.
+// Robin Hood hashing is open addressing that moves keys with shorter probe
+// sequences to make room for keys with longer ones, which keeps the
+// sequences short and close together.
+// See http://web.archive.org/web/20201107002606/https://marcelk.net/2013-04-06/paper/upcoming-rep-v2.pdf
+// and https://cs.uwaterloo.ca/research/tr/1986/CS-86-14.pdf
+
+const REPETITION_TABLE_SIZE: usize = 8192;
+const REPETITION_TABLE_MASK: usize = REPETITION_TABLE_SIZE - 1;
+
+const fn repetition_hash(key: Key) -> usize {
+    key as usize & REPETITION_TABLE_MASK
 }
 
-static CUCKOO: Cuckoo = {
-    let mut c = Cuckoo {
-        keys: [0; 8192],
-        moves: [Move::none(); 8192],
+struct RepetitionTable {
+    keys: [Key; REPETITION_TABLE_SIZE],
+    moves: [Move; REPETITION_TABLE_SIZE],
+    /// How far each key is from its hash's slot, plus one: zero marks an
+    /// empty slot.
+    distances: [u8; REPETITION_TABLE_SIZE],
+    count: usize,
+    max_distance: usize,
+}
+
+static REPETITION_TABLE: RepetitionTable = {
+    let mut t = RepetitionTable {
+        keys: [0; REPETITION_TABLE_SIZE],
+        moves: [Move::none(); REPETITION_TABLE_SIZE],
+        distances: [0; REPETITION_TABLE_SIZE],
+        count: 0,
+        max_distance: 0,
     };
-    let mut count = 0;
     let mut i = 0;
     while i < PIECES.len() {
         let pc = PIECES[i];
@@ -119,22 +210,45 @@ static CUCKOO: Cuckoo = {
                     let mut key = ZOBRIST.psq[pc.0 as usize][s1]
                         ^ ZOBRIST.psq[pc.0 as usize][s2]
                         ^ ZOBRIST.side;
-                    let mut j = h1(key);
+                    let mut j = repetition_hash(key);
+                    let mut distance = 1;
                     loop {
-                        let evicted_key = c.keys[j];
-                        let evicted_move = c.moves[j];
-                        c.keys[j] = key;
-                        c.moves[j] = mv;
-                        key = evicted_key;
-                        mv = evicted_move;
-                        // Arrived at an empty slot?
-                        if mv.0 == Move::none().0 {
+                        assert!(
+                            distance <= 255,
+                            "repetition table displacement must fit in one byte"
+                        );
+
+                        // An empty slot takes the key and its move.
+                        if t.distances[j] == 0 {
+                            t.keys[j] = key;
+                            t.moves[j] = mv;
+                            t.distances[j] = distance as u8;
+                            if distance > t.max_distance {
+                                t.max_distance = distance;
+                            }
                             break;
                         }
-                        // Push the victim to its alternative slot.
-                        j = if j == h1(key) { h2(key) } else { h1(key) };
+
+                        // A slot whose key is closer to its hash's slot than
+                        // this key takes this one, and the probe goes on
+                        // with the key displaced.
+                        if (t.distances[j] as usize) < distance {
+                            let (k, m, d) = (t.keys[j], t.moves[j], t.distances[j]);
+                            t.keys[j] = key;
+                            t.moves[j] = mv;
+                            t.distances[j] = distance as u8;
+                            if distance > t.max_distance {
+                                t.max_distance = distance;
+                            }
+                            key = k;
+                            mv = m;
+                            distance = d as usize;
+                        }
+
+                        distance += 1;
+                        j = (j + 1) & REPETITION_TABLE_MASK;
                     }
-                    count += 1;
+                    t.count += 1;
                 }
                 s2 += 1;
             }
@@ -142,17 +256,58 @@ static CUCKOO: Cuckoo = {
         }
         i += 1;
     }
-    assert!(count == 3668);
-    c
+    assert!(
+        t.count == 3668,
+        "repetition table insertion count must be stable"
+    );
+    t
+};
+
+// Every key is found from its hash's slot at its distance, past no slot
+// whose own key is nearer its hash's slot.
+const _: () = {
+    let t = &REPETITION_TABLE;
+    let mut count = 0;
+    let mut max_distance = 0;
+    let mut i = 0;
+    while i < REPETITION_TABLE_SIZE {
+        let distance = t.distances[i] as usize;
+        if distance != 0 {
+            count += 1;
+            if distance > max_distance {
+                max_distance = distance;
+            }
+            let mut j = repetition_hash(t.keys[i]);
+            let mut probe_distance = 1;
+            while j != i {
+                assert!(
+                    (t.distances[j] as usize) >= probe_distance && t.keys[j] != t.keys[i],
+                    "repetition table lookup invariants must hold"
+                );
+                j = (j + 1) & REPETITION_TABLE_MASK;
+                probe_distance += 1;
+            }
+            assert!(
+                distance == probe_distance,
+                "repetition table lookup invariants must hold"
+            );
+        }
+        i += 1;
+    }
+    assert!(count == t.count && max_distance == t.max_distance);
 };
 
 /// What a search prefetches while a move is made, once the new position's
-/// keys are known: Stockfish passes `do_move` its transposition table and
-/// shared histories for this. `key` is the new position's key as `key()`
-/// will return it, `st` its state so far, and `pc` the piece moved to `to`,
-/// the king's destination when castling.
+/// keys are known: Stockfish passes `do_move` its shared histories for this.
+/// `st` is the new position's state so far, and `pc` the piece moved to
+/// `to`, the king's destination when castling.
 pub trait Prefetcher {
-    fn prefetch<V: Variant>(&self, key: Key, st: &StateInfo<V>, pc: Piece, to: Square);
+    fn prefetch<V: Variant>(&self, st: &StateInfo<V>, pc: Piece, to: Square);
+
+    /// The transposition table's cluster for `key`, the new position's
+    /// key as the table is probed, which only Atomic's do_move asks for:
+    /// the search prefetches chess's before the move.
+    fn prefetch_tt(&self, key: Key);
 }
 
 /// A prefetcher that prefetches nothing.
@@ -160,7 +315,10 @@ pub struct NoPrefetch;
 
 impl Prefetcher for NoPrefetch {
     #[inline(always)]
-    fn prefetch<V: Variant>(&self, _: Key, _: &StateInfo<V>, _: Piece, _: Square) {}
+    fn prefetch<V: Variant>(&self, _: &StateInfo<V>, _: Piece, _: Square) {}
+
+    #[inline(always)]
+    fn prefetch_tt(&self, _: Key) {}
 }
 
 /// What a move needs to be undone, and what is worked out once per position.
@@ -192,6 +350,7 @@ pub struct StateInfo<V: Variant = Chess> {
     // Computed when first asked for, by threats_by: ALL_PIECES's is empty
     // until then
     threats: [Cell<Bitboard>; PIECE_TYPE_NB],
+    pub piece_placement: PiecePlacement,
 
     // What the variant keeps besides
     pub extra: V::StateExtra,
@@ -561,12 +720,13 @@ impl<V: Variant> Position<V> {
                 if self.piece_on(rsq_candidate) == rook {
                     rsq = rsq_candidate;
                 }
-                let mut sq = Square::B1.relative(c);
-                for _ in 0..6 {
-                    if self.piece_on(sq) == king {
+                // Castling rights keep the king between files B and G, on its
+                // first rank. In Atomic the side to move may have lost it.
+                if self.has_king(c) {
+                    let sq = self.king_square(c);
+                    if sq.relative_rank(c) == RANK_1 && (FILE_B..=FILE_G).contains(&sq.file()) {
                         ksq = sq;
                     }
-                    sq += EAST;
                 }
             } else {
                 return error(format!(
@@ -583,7 +743,6 @@ impl<V: Variant> Position<V> {
         // 4. En passant square, kept only if a pawn of the side to move
         // attacks it, an enemy pawn stands in front of it, it and the square
         // behind it are empty, and some en passant capture is legal.
-        let mut enpassant = false;
         let mut legal_ep = false;
         let col = ss.get().unwrap_or(b'-');
         if col != b'-' {
@@ -598,7 +757,7 @@ impl<V: Variant> Position<V> {
                 let target = self.pieces_cpt(!stm, PAWN) & (st.ep_square + pawn_push(!stm));
                 let occ = self.pieces() ^ target ^ st.ep_square;
 
-                enpassant = pawns.any()
+                let enpassant = pawns.any()
                     && target.any()
                     && (self.pieces() & (st.ep_square | (st.ep_square + pawn_push(stm))))
                         .is_empty();
@@ -606,9 +765,9 @@ impl<V: Variant> Position<V> {
                 if V::ATOMIC {
                     legal_ep = enpassant && self.atomic_ep_is_legal(st.ep_square);
                 } else {
-                    while pawns.any() {
+                    while enpassant && pawns.any() && !legal_ep {
                         let from = pawns.pop_lsb();
-                        legal_ep |= (self.attackers_to_occ(self.king_square(stm), occ ^ from)
+                        legal_ep = (self.attackers_to_occ(self.king_square(stm), occ ^ from)
                             & self.pieces_c(!stm)
                             & !target)
                             .is_empty();
@@ -619,7 +778,7 @@ impl<V: Variant> Position<V> {
             }
         }
 
-        if !enpassant || !legal_ep {
+        if !legal_ep {
             st.ep_square = Square::NONE;
         }
 
@@ -753,10 +912,10 @@ impl<V: Variant> Position<V> {
     /// Computes the hash keys and the other state that is then updated
     /// incrementally as moves are made, when a position is set.
     fn set_state(&self, st: &mut StateInfo<V>) {
-        st.key = 0;
+        st.key = self.side_to_move.0 as Key;
         st.minor_piece_key = 0;
         st.non_pawn_key = [0; COLOR_NB];
-        st.pawn_key = ZOBRIST.no_pawns;
+        st.pawn_key = 0;
         st.non_pawn_material = [VALUE_ZERO; COLOR_NB];
         st.checkers_bb = if V::ATOMIC {
             self.atomic_checkers_of(self.side_to_move)
@@ -791,12 +950,9 @@ impl<V: Variant> Position<V> {
             st.key ^= ZOBRIST.enpassant[st.ep_square.file() as usize];
         }
 
-        if self.side_to_move == BLACK {
-            st.key ^= ZOBRIST.side;
-        }
-
         st.key ^= ZOBRIST.castling[st.castling_rights as usize & 15];
         st.material_key = self.compute_material_key();
+        st.piece_placement = pack_pieces(&self.board);
     }
 
     fn compute_material_key(&self) -> Key {
@@ -1020,7 +1176,7 @@ impl<V: Variant> Position<V> {
         debug_assert!(self.checkers().is_empty());
 
         // SAFETY: the state is pushed below, before `states` changes.
-        let st = unsafe { self.next_state_copy() };
+        let st = unsafe { self.next_state_null() };
 
         if st.ep_square != Square::NONE {
             st.key ^= ZOBRIST.enpassant[st.ep_square.file() as usize];
@@ -1030,6 +1186,7 @@ impl<V: Variant> Position<V> {
         st.key ^= ZOBRIST.side;
         st.plies_from_null = 0;
         st.captured_piece = NO_PIECE;
+        st.piece_placement = self.st().piece_placement;
 
         self.side_to_move = !self.side_to_move;
 
@@ -1142,26 +1299,36 @@ impl<V: Variant> Position<V> {
                 let stp = &self.states[idx];
                 let move_key = original_key ^ stp.key;
 
-                let mut j = h1(move_key);
-                if CUCKOO.keys[j] != move_key {
-                    j = h2(move_key);
-                }
-                if CUCKOO.keys[j] == move_key {
-                    let mv = CUCKOO.moves[j];
-                    let s1 = mv.from_sq();
-                    let s2 = mv.to_sq();
+                let mut j = repetition_hash(move_key);
+                let mut distance = 1;
 
-                    if ((between_bb(s1, s2) ^ s2) & self.pieces()).is_empty() {
-                        if ply > i {
-                            return true;
+                // Probe for the move's key, as far as the keys met lie no
+                // further from their hashes' slots.
+                while REPETITION_TABLE.distances[j] as usize >= distance {
+                    if REPETITION_TABLE.keys[j] == move_key {
+                        let mv = REPETITION_TABLE.moves[j];
+                        let s1 = mv.from_sq();
+                        let s2 = mv.to_sq();
+
+                        // The path must be clear of pieces for a move to be
+                        // legal.
+                        if ((between_bb(s1, s2) ^ s2) & self.pieces()).is_empty() {
+                            let mut b = st.piece_placement;
+                            swap_nibble(&mut b, s1, s2);
+
+                            // For nodes before or at the root, check that the
+                            // move is a repetition rather than a move to the
+                            // current position.
+                            if b == stp.piece_placement && (ply > i || stp.repetition != 0) {
+                                return true;
+                            }
                         }
 
-                        // At or before the root, the move must repeat a
-                        // position rather than reach the current one.
-                        if stp.repetition != 0 {
-                            return true;
-                        }
+                        break;
                     }
+
+                    distance += 1;
+                    j = (j + 1) & REPETITION_TABLE_MASK;
                 }
             }
             i += 2;
@@ -1278,9 +1445,10 @@ impl<V: Variant> Position<V> {
             return Err("pos_is_ok: Bitboards");
         }
 
-        for p1 in [PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING] {
-            for p2 in [PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING] {
-                if p1 != p2 && (self.pieces_pt(p1) & self.pieces_pt(p2)).any() {
+        let types = [PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING];
+        for (i, &p1) in types.iter().enumerate() {
+            for &p2 in &types[i + 1..] {
+                if (self.pieces_pt(p1) & self.pieces_pt(p2)).any() {
                     return Err("pos_is_ok: Bitboards");
                 }
             }
@@ -1347,16 +1515,23 @@ impl<V: Variant> Position<V> {
         unsafe { self.states.next(StateInfo::<V>::CARRIED) }
     }
 
-    /// `next_state` with the whole current state copied, for a null move,
-    /// which keeps most of it.
+    /// `next_state` with the current state copied up to the blockers of the
+    /// kings, for a null move, which keeps the key and the checkers too, as
+    /// Stockfish's do_null_move copies its StateInfo. The null move sets the
+    /// fields after them, but for the threats, which it marks as not yet
+    /// computed, and Atomic's `extra`, which only undoing a capture reads.
     ///
     /// # Safety
     ///
     /// As for `next_state`.
     #[inline(always)]
-    unsafe fn next_state_copy<'a>(&mut self) -> &'a mut StateInfo<V> {
-        // SAFETY: a state's bytes; the caller keeps the rest of the contract.
-        unsafe { self.states.next(std::mem::size_of::<StateInfo<V>>()) }
+    unsafe fn next_state_null<'a>(&mut self) -> &'a mut StateInfo<V> {
+        // SAFETY: the bytes before `blockers_for_king`, within a state; the
+        // caller keeps the rest of the contract.
+        unsafe {
+            self.states
+                .next(std::mem::offset_of!(StateInfo<V>, blockers_for_king))
+        }
     }
 
     /// Makes the state that `next_state` returned the current one.
@@ -1546,13 +1721,13 @@ impl<V: Variant> Position<V> {
         if rule50 < threshold {
             k
         } else {
-            k ^ make_key(((rule50 - threshold) / 8) as u64)
+            k ^ make_key(((rule50 - threshold) / 8) as u64) << 1
         }
     }
 
     #[inline(always)]
     pub fn pawn_key(&self) -> Key {
-        self.st().pawn_key
+        self.st().pawn_key ^ self.side_to_move.0 as Key
     }
 
     #[inline(always)]
@@ -1562,12 +1737,12 @@ impl<V: Variant> Position<V> {
 
     #[inline(always)]
     pub fn minor_piece_key(&self) -> Key {
-        self.st().minor_piece_key
+        self.st().minor_piece_key ^ self.side_to_move.0 as Key
     }
 
     #[inline(always)]
     pub fn non_pawn_key(&self, c: Color) -> Key {
-        self.st().non_pawn_key[c.idx()]
+        self.st().non_pawn_key[c.idx()] ^ self.side_to_move.0 as Key
     }
 
     #[inline(always)]
@@ -1648,7 +1823,7 @@ impl<V: Variant> Position<V> {
         self.piece_count[piece_count_index(pc.color(), ALL_PIECES)] += 1;
 
         if let Some(dts) = dts {
-            self.update_piece_threats::<true>(pc, true, s, dts, Bitboard::ALL);
+            self.update_piece_threats::<true, _>(pc, true, s, dts, Bitboard::ALL);
         }
     }
 
@@ -1657,7 +1832,7 @@ impl<V: Variant> Position<V> {
         let pc = self.board[s.idx()];
 
         if let Some(dts) = dts {
-            self.update_piece_threats::<true>(pc, false, s, dts, Bitboard::ALL);
+            self.update_piece_threats::<true, _>(pc, false, s, dts, Bitboard::ALL);
         }
 
         self.by_type_bb[ALL_PIECES.idx()] ^= s;
@@ -1674,7 +1849,7 @@ impl<V: Variant> Position<V> {
         let from_to = from | to;
 
         if let Some(dts) = dts.as_deref_mut() {
-            self.update_piece_threats::<true>(pc, false, from, dts, from_to);
+            self.update_piece_threats::<true, _>(pc, false, from, dts, from_to);
         }
 
         self.by_type_bb[ALL_PIECES.idx()] ^= from_to;
@@ -1684,7 +1859,7 @@ impl<V: Variant> Position<V> {
         self.board[to.idx()] = pc;
 
         if let Some(dts) = dts {
-            self.update_piece_threats::<true>(pc, true, to, dts, from_to);
+            self.update_piece_threats::<true, _>(pc, true, to, dts, from_to);
         }
     }
 
@@ -1695,13 +1870,13 @@ impl<V: Variant> Position<V> {
         self.remove_piece(s, None);
 
         if let Some(dts) = dts.as_deref_mut() {
-            self.update_piece_threats::<false>(old, false, s, dts, Bitboard::ALL);
+            self.update_piece_threats::<false, _>(old, false, s, dts, Bitboard::ALL);
         }
 
         self.put_piece(pc, s, None);
 
         if let Some(dts) = dts {
-            self.update_piece_threats::<false>(pc, true, s, dts, Bitboard::ALL);
+            self.update_piece_threats::<false, _>(pc, true, s, dts, Bitboard::ALL);
         }
     }
 
@@ -1711,12 +1886,12 @@ impl<V: Variant> Position<V> {
     /// along a line that holds both squares of `no_rays_containing`. Out of
     /// line, as Stockfish's is, since each move calls it several times.
     #[inline(never)]
-    fn update_piece_threats<const COMPUTE_RAY: bool>(
+    pub(crate) fn update_piece_threats<const COMPUTE_RAY: bool, const N: usize>(
         &self,
         pc: Piece,
         put_piece: bool,
         s: Square,
-        dts: &mut DirtyThreats,
+        dts: &mut ValueList<DirtyThreat, N>,
         no_rays_containing: Bitboard,
     ) {
         let occupied = self.pieces();
@@ -1775,14 +1950,20 @@ impl<V: Variant> Position<V> {
         // among them, in another.
         #[cfg(use_avx512icl)]
         {
-            self.write_threats::<true>(pc, put_piece, s, threatened, dts);
+            self.write_threats::<true, N>(pc, put_piece, s, threatened, dts);
 
             let direct_sliders = if pt == QUEEN {
                 sliders & self.pieces_pt(QUEEN)
             } else {
                 sliders
             };
-            self.write_threats::<false>(pc, put_piece, s, direct_sliders | incoming_threats, dts);
+            self.write_threats::<false, N>(
+                pc,
+                put_piece,
+                s,
+                direct_sliders | incoming_threats,
+                dts,
+            );
 
             if COMPUTE_RAY {
                 self.process_sliders(
@@ -1854,13 +2035,13 @@ impl<V: Variant> Position<V> {
     /// Stockfish's `write_multiple_dirties`.
     #[cfg(use_avx512icl)]
     #[inline(always)]
-    fn write_threats<const OUTGOING: bool>(
+    fn write_threats<const OUTGOING: bool, const N: usize>(
         &self,
         pc: Piece,
         put_piece: bool,
         s: Square,
         mask: Bitboard,
-        dts: &mut DirtyThreats,
+        dts: &mut ValueList<DirtyThreat, N>,
     ) {
         use std::arch::x86_64::*;
         // A piece attacks at most 8 pieces, and at most 16 attack it: 8
@@ -1906,7 +2087,7 @@ impl<V: Variant> Position<V> {
     /// makes on the next piece beyond `s`, which `pc` hides or reveals.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
-    fn process_sliders(
+    fn process_sliders<const N: usize>(
         &self,
         pc: Piece,
         put_piece: bool,
@@ -1916,7 +2097,7 @@ impl<V: Variant> Position<V> {
         occupied_no_k: Bitboard,
         no_rays_containing: Bitboard,
         add_direct_attacks: bool,
-        dts: &mut DirtyThreats,
+        dts: &mut ValueList<DirtyThreat, N>,
     ) {
         for slider_sq in sliders {
             let slider = self.piece_on(slider_sq);
@@ -2249,12 +2430,7 @@ impl Position<Chess> {
             }
         }
 
-        let key = if st.rule50 < 14 {
-            k
-        } else {
-            k ^ make_key(((st.rule50 - 14) / 8) as u64)
-        };
-        prefetcher.prefetch(key, st, pc, to);
+        prefetcher.prefetch(st, pc, to);
 
         st.key = k;
 
@@ -2289,9 +2465,12 @@ impl Position<Chess> {
 
         self.set_extra_bitboards(st);
 
+        st.piece_placement = pack_pieces(&self.board);
+
         // The distance in plies to the previous occurrence of the same
         // position, negative for a third occurrence, or zero if it did not
-        // occur since the last irreversible move.
+        // occur since the last irreversible move. The piece placement, in
+        // addition to the key, makes it exact.
         st.repetition = 0;
         let end = st.rule50.min(st.plies_from_null);
         if end >= 4 {
@@ -2299,7 +2478,7 @@ impl Position<Chess> {
             let mut i = 4;
             while i <= end {
                 let stp = &self.states[n - i as usize];
-                if stp.key == st.key {
+                if stp.key == st.key && stp.piece_placement == st.piece_placement {
                     st.repetition = if stp.repetition != 0 { -i } else { i };
                     break;
                 }

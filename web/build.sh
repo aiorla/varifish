@@ -7,7 +7,8 @@
 # losses from the tablebases given, if any (1.2 MB). Into web/dist, or into
 # the directory given. manifest.json names them all, and a page fetches it
 # fresh; each file but the tables has a gzipped copy beside it, for servers
-# that send it compressed (the network shrinks from 48 to 27 MB).
+# that send it compressed (run3b, Atomic-Stockfish's network, shrinks from 48
+# to 27 MB).
 #
 # With --share, a folder served beside the one built (another engine's build,
 # say), a file whose bytes that folder already holds is named there rather

@@ -19,32 +19,23 @@ mod atomic;
 
 pub use atomic::AtomicMovePicker;
 
-// The stages of the move picker
+// The stages of the move picker. Each kind of move picker (main search,
+// quiescence search, evasions, ProbCut) has its first stage after the TT
+// move and the generation of its first moves.
 type Stage = u8;
 
-// generate main search moves
-const MAIN_TT: Stage = 0;
-const CAPTURE_INIT: Stage = 1;
+const TT: Stage = 0;
+const INIT_FIRST_STAGE: Stage = 1;
+
 const GOOD_CAPTURE: Stage = 2;
-const QUIET_INIT: Stage = 3;
-const GOOD_QUIET: Stage = 4;
-const BAD_CAPTURE: Stage = 5;
-const BAD_QUIET: Stage = 6;
+const GOOD_QUIET: Stage = 3;
+const BAD_MOVES: Stage = 4;
 
-// generate evasion moves
-const EVASION_TT: Stage = 7;
-const EVASION_INIT: Stage = 8;
-const EVASION: Stage = 9;
+const QSEARCH: Stage = 5;
 
-// generate probcut moves
-const PROBCUT_TT: Stage = 10;
-const PROBCUT_INIT: Stage = 11;
-const PROBCUT: Stage = 12;
+const EVASION: Stage = 6;
 
-// generate qsearch moves
-const QSEARCH_TT: Stage = 13;
-const QCAPTURE_INIT: Stage = 14;
-const QCAPTURE: Stage = 15;
+const PROBCUT: Stage = 7;
 
 /// A move and its score for ordering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,11 +91,10 @@ impl MoveSorter {
 
     /// Sorts the moves of at least `limit`, from the first, until sixteen
     /// are sorted, as the insertion sort does. Returns the index of the last
-    /// sorted and of the first move not yet seen, or None if there are no
-    /// moves.
+    /// sorted and of the first move not yet seen. There must be a move.
     #[inline(always)]
-    fn sort_head(moves: &mut [ExtMove], limit: i32) -> Option<(usize, usize)> {
-        let mut sorter = MoveSorter::new(*moves.first()?);
+    fn sort_head(moves: &mut [ExtMove], limit: i32) -> (usize, usize) {
+        let mut sorter = MoveSorter::new(moves[0]);
         let mut sorted_end = 0;
         let mut p = 1;
         while p < moves.len() {
@@ -120,7 +110,7 @@ impl MoveSorter {
             p += 1;
         }
         sorter.write_sorted(&mut moves[..sorted_end + 1]);
-        Some((sorted_end, p))
+        (sorted_end, p)
     }
 
     /// Writes the moves inserted, the first, sorted, over `moves`.
@@ -166,12 +156,14 @@ impl MoveSorter {
 /// Sort moves in descending order up to and including a given limit. The
 /// order of moves smaller than the limit is left unspecified.
 fn partial_insertion_sort(moves: &mut [ExtMove], limit: i32) {
+    if moves.len() <= 1 {
+        return;
+    }
+
     // With AVX-512, the first sixteen moves of the limit are sorted in
     // vectors, and the insertion sort sorts the rest.
     #[cfg(use_avx512)]
-    let Some((mut sorted_end, start)) = MoveSorter::sort_head(moves, limit) else {
-        return;
-    };
+    let (mut sorted_end, start) = MoveSorter::sort_head(moves, limit);
     #[cfg(not(use_avx512))]
     let (mut sorted_end, start) = (0, 1);
 
@@ -204,15 +196,14 @@ pub struct MovePicker<'a> {
     cur: usize,
     end_cur: usize,
     end_bad_captures: usize,
-    end_captures: usize,
-    end_generated: usize,
+    end_bad_moves: usize,
     stage: Stage,
+    first_stage: Stage,
     threshold: i32,
     depth: Depth,
     ply: i32,
     skip_quiets: bool,
-    // Initialized from the start up to end_generated, or end_cur where the
-    // quiets are not generated
+    // Written below end_cur, and below end_bad_moves
     moves: [MaybeUninit<ExtMove>; MOVE_LIST_SIZE],
 }
 
@@ -226,17 +217,20 @@ impl<'a> MovePicker<'a> {
         ch: [&'a PieceToHistory; 6],
         pl: i32,
     ) -> MovePicker<'a> {
-        let has_tt_move = ttm != Move::none() && pos.legal(ttm);
         let first_stage = if pos.checkers().any() {
-            EVASION_TT
+            EVASION
         } else if d > 0 {
-            MAIN_TT
+            GOOD_CAPTURE
         } else {
-            QSEARCH_TT
+            QSEARCH
         };
-        let stage = first_stage + !has_tt_move as Stage;
+        let stage = if ttm != Move::none() && pos.legal(ttm) {
+            TT
+        } else {
+            INIT_FIRST_STAGE
+        };
 
-        MovePicker::with(stage, ttm, d, 0, ch, pl)
+        MovePicker::with(stage, first_stage, ttm, d, 0, ch, pl)
     }
 
     /// A move picker for ProbCut: we generate captures with Static Exchange
@@ -250,16 +244,20 @@ impl<'a> MovePicker<'a> {
     ) -> MovePicker<'a> {
         debug_assert!(pos.checkers().is_empty());
 
-        let has_tt_move = ttm != Move::none() && pos.capture_stage(ttm) && pos.legal(ttm);
-        let stage = PROBCUT_TT + !has_tt_move as Stage;
+        let stage = if ttm != Move::none() && pos.capture_stage(ttm) && pos.legal(ttm) {
+            TT
+        } else {
+            INIT_FIRST_STAGE
+        };
         let ch = [shared.continuation(0); 6];
 
-        MovePicker::with(stage, ttm, 0, th, ch, 0)
+        MovePicker::with(stage, PROBCUT, ttm, 0, th, ch, 0)
     }
 
     #[inline(always)]
     fn with(
         stage: Stage,
+        first_stage: Stage,
         tt_move: Move,
         depth: Depth,
         threshold: i32,
@@ -272,9 +270,9 @@ impl<'a> MovePicker<'a> {
             cur: 0,
             end_cur: 0,
             end_bad_captures: 0,
-            end_captures: 0,
-            end_generated: 0,
+            end_bad_moves: 0,
             stage,
+            first_stage,
             threshold,
             depth,
             ply,
@@ -285,8 +283,9 @@ impl<'a> MovePicker<'a> {
 
     #[inline(always)]
     fn get(&self, i: usize) -> ExtMove {
-        debug_assert!(i < self.end_cur.max(self.end_generated));
-        // SAFETY: the moves are read below the end of those written.
+        debug_assert!(i < self.end_cur);
+        // SAFETY: the moves are read below end_cur, below which all were
+        // written.
         unsafe { self.moves[i & (MOVE_LIST_SIZE - 1)].assume_init() }
     }
 
@@ -340,6 +339,11 @@ impl<'a> MovePicker<'a> {
         let pawn_entry = shared.pawn_entry(pos);
         let main_history = &h.main_history[us.idx()];
         let ch = self.continuation_history;
+        let low_ply_history = if T == QUIETS && self.ply < LOW_PLY_HISTORY_SIZE as i32 {
+            Some(&h.low_ply_history[self.ply as usize])
+        } else {
+            None
+        };
 
         let mut it = self.cur;
         for &m in ml {
@@ -362,18 +366,19 @@ impl<'a> MovePicker<'a> {
                 value += ch[3][pc.idx()][to.idx()].get();
                 value += ch[5][pc.idx()][to.idx()].get();
 
-                // bonus for checks
-                value += (pos.check_squares(pt).has(to) && pos.see_ge(m, -75)) as i32 * 16384;
-
                 // penalty for moving to a square threatened by a lesser
                 // piece or bonus for escaping an attack by a lesser piece.
                 let threats = threat_by_lesser[pt.idx() & 7];
                 let v = 20 * (threats.has(from) as i32 - threats.has(to) as i32);
                 value += PIECE_VALUE[pt.idx()] * v;
 
-                if self.ply < LOW_PLY_HISTORY_SIZE as i32 {
-                    let ply = self.ply as usize;
-                    value += 8 * h.low_ply_history[ply][m.raw() as usize].get() / (1 + self.ply);
+                if let Some(lph) = low_ply_history {
+                    value += 8 * lph[m.raw() as usize].get() / (1 + self.ply);
+                }
+
+                // bonus for checks
+                if pos.check_squares(pt).has(to) && pos.see_ge(m, -75) {
+                    value += 16384;
                 }
 
                 value
@@ -406,9 +411,8 @@ impl<'a> MovePicker<'a> {
         ml.generate::<CAPTURES>(pos);
 
         self.cur = 0;
-        self.end_bad_captures = 0;
+        self.end_bad_moves = 0;
         self.end_cur = self.score::<CAPTURES>(&ml, pos, h, shared);
-        self.end_captures = self.end_cur;
 
         let (cur, end_cur) = (self.cur, self.end_cur);
         partial_insertion_sort(self.slice_mut(cur, end_cur), i32::MIN);
@@ -424,8 +428,9 @@ impl<'a> MovePicker<'a> {
         let mut ml = MoveList::empty();
         ml.generate::<QUIETS>(pos);
 
+        // The quiets follow the bad captures
+        self.cur = self.end_bad_moves;
         self.end_cur = self.score::<QUIETS>(&ml, pos, h, shared);
-        self.end_generated = self.end_cur;
 
         let (cur, end_cur, limit) = (self.cur, self.end_cur, -3560 * self.depth);
         partial_insertion_sort(self.slice_mut(cur, end_cur), limit);
@@ -442,8 +447,8 @@ impl<'a> MovePicker<'a> {
         ml.generate::<EVASIONS>(pos);
 
         self.cur = 0;
+        self.end_bad_moves = 0;
         self.end_cur = self.score::<EVASIONS>(&ml, pos, h, shared);
-        self.end_generated = self.end_cur;
 
         let (cur, end_cur) = (self.cur, self.end_cur);
         partial_insertion_sort(self.slice_mut(cur, end_cur), i32::MIN);
@@ -477,119 +482,99 @@ impl<'a> MovePicker<'a> {
 
         // Each stage falls through to the next, as in Stockfish's switch:
         // the blocks below end where a stage's code starts, so that only
-        // the stages that generate captures dispatch on the stage again.
+        // the first stage's generation dispatches on the stage again.
         'dispatch: loop {
-            'bad_quiet: {
-                'bad_capture: {
+            'bad_moves: {
+                'prepare_bad_moves: {
                     'good_quiet: {
-                        'quiet_init: {
-                            'good_capture: {
-                                'evasion: {
-                                    match self.stage {
-                                        MAIN_TT | EVASION_TT | QSEARCH_TT | PROBCUT_TT => {
-                                            self.stage += 1;
-                                            return self.tt_move;
-                                        }
-
-                                        CAPTURE_INIT | PROBCUT_INIT | QCAPTURE_INIT => {
-                                            self.init_captures(pos, h, shared);
-                                            self.stage += 1;
-                                            continue 'dispatch;
-                                        }
-
-                                        GOOD_CAPTURE => break 'good_capture,
-                                        QUIET_INIT => break 'quiet_init,
-                                        GOOD_QUIET => break 'good_quiet,
-                                        BAD_CAPTURE => break 'bad_capture,
-                                        BAD_QUIET => break 'bad_quiet,
-
-                                        EVASION_INIT => {
-                                            self.init_evasions(pos, h, shared);
-                                            self.stage = EVASION;
-                                            break 'evasion;
-                                        }
-
-                                        EVASION | QCAPTURE => break 'evasion,
-
-                                        PROBCUT => {
-                                            let threshold = self.threshold;
-                                            return self.select(|m| pos.see_ge(m.mv, threshold));
-                                        }
-
-                                        _ => unreachable!("no move picker stage {}", self.stage),
-                                    }
+                        'good_capture: {
+                            match self.stage {
+                                TT => {
+                                    self.stage = INIT_FIRST_STAGE;
+                                    return self.tt_move;
                                 }
 
-                                // EVASION and QCAPTURE
-                                return self.select(|_| true);
-                            }
-
-                            // GOOD_CAPTURE
-                            while self.cur < self.end_cur {
-                                let m = self.get(self.cur);
-                                if m.mv != self.tt_move {
-                                    if pos.see_ge(m.mv, -m.value / 18) {
-                                        self.cur += 1;
-                                        return m.mv;
+                                INIT_FIRST_STAGE => {
+                                    if self.first_stage == EVASION {
+                                        self.init_evasions(pos, h, shared);
+                                    } else {
+                                        self.init_captures(pos, h, shared);
                                     }
-                                    let bad = self.get(self.end_bad_captures);
-                                    self.set(self.end_bad_captures, m);
-                                    self.set(self.cur, bad);
-                                    self.end_bad_captures += 1;
+                                    self.stage = self.first_stage;
+                                    continue 'dispatch;
                                 }
-                                self.cur += 1;
+
+                                GOOD_CAPTURE => break 'good_capture,
+                                GOOD_QUIET => break 'good_quiet,
+                                BAD_MOVES | QSEARCH | EVASION => break 'bad_moves,
+
+                                PROBCUT => {
+                                    let threshold = self.threshold;
+                                    return self.select(|m| pos.see_ge(m.mv, threshold));
+                                }
+
+                                _ => unreachable!("no move picker stage {}", self.stage),
                             }
-
-                            self.stage = QUIET_INIT;
                         }
 
-                        // QUIET_INIT
-                        if !self.skip_quiets {
-                            self.init_quiets(pos, h, shared);
+                        // GOOD_CAPTURE
+                        while self.cur < self.end_cur {
+                            let m = self.get(self.cur);
+                            self.cur += 1;
+                            if m.mv != self.tt_move {
+                                if pos.see_ge(m.mv, -m.value / 18) {
+                                    return m.mv;
+                                }
+                                self.set(self.end_bad_moves, m);
+                                self.end_bad_moves += 1;
+                            }
                         }
+
+                        self.end_bad_captures = self.end_bad_moves;
+
+                        if self.skip_quiets {
+                            break 'prepare_bad_moves;
+                        }
+
+                        self.init_quiets(pos, h, shared);
 
                         self.stage = GOOD_QUIET;
                     }
 
-                    // GOOD_QUIET
-                    if !self.skip_quiets {
-                        let m = self.select(|m| m.value > GOOD_QUIET_THRESHOLD);
-                        if m != Move::none() {
-                            return m;
+                    // GOOD_QUIET: the bad quiets join the bad captures
+                    while self.cur < self.end_cur {
+                        let m = self.get(self.cur);
+                        self.cur += 1;
+                        if m.mv != self.tt_move {
+                            if m.value > GOOD_QUIET_THRESHOLD {
+                                return m.mv;
+                            }
+                            self.set(self.end_bad_moves, m);
+                            self.end_bad_moves += 1;
                         }
                     }
-
-                    // Prepare the pointers to loop over the bad captures
-                    self.cur = 0;
-                    self.end_cur = self.end_bad_captures;
-
-                    self.stage = BAD_CAPTURE;
                 }
 
-                // BAD_CAPTURE
-                let m = self.select(|_| true);
-                if m != Move::none() {
-                    return m;
-                }
+                // Prepare the pointers to loop over the bad moves
+                self.cur = 0;
+                self.end_cur = self.end_bad_moves;
 
-                // Prepare the pointers to loop over quiets again
-                self.cur = self.end_captures;
-                self.end_cur = self.end_generated;
-
-                self.stage = BAD_QUIET;
+                self.stage = BAD_MOVES;
             }
 
-            // BAD_QUIET
-            if !self.skip_quiets {
-                return self.select(|m| m.value <= GOOD_QUIET_THRESHOLD);
-            }
-
-            return Move::none();
+            // BAD_MOVES, QSEARCH and EVASION
+            return self.select(|_| true);
         }
     }
 
     pub fn skip_quiet_moves(&mut self) {
         self.skip_quiets = true;
+        if self.stage == BAD_MOVES || self.stage == GOOD_QUIET {
+            // Discards any quiet moves in the current stage, and the bad
+            // quiets
+            self.end_cur = self.end_bad_captures;
+            self.end_bad_moves = self.end_bad_captures;
+        }
     }
 }
 

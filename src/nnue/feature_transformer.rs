@@ -30,6 +30,7 @@ const HALF_DIMENSIONS: usize = L1;
 pub const THREAT_INPUT_DIMENSIONS: usize = ThreatFeatureSet::DIMENSIONS as usize;
 pub const PAIR_INPUT_DIMENSIONS: usize = PairFeatureSet::DIMENSIONS as usize;
 pub const PSQ_DIMENSIONS: usize = PsqFeatureSet::DIMENSIONS;
+pub const PSQ_BLOCK_DIMENSIONS: usize = PsqFeatureSet::BLOCK_DIMENSIONS;
 pub const THREAT_AND_PP_DIMENSIONS: usize = THREAT_INPUT_DIMENSIONS + PAIR_INPUT_DIMENSIONS;
 pub const INPUT_DIMENSIONS: usize = PSQ_DIMENSIONS + THREAT_AND_PP_DIMENSIONS;
 pub const OUTPUT_DIMENSIONS: usize = HALF_DIMENSIONS;
@@ -116,7 +117,7 @@ pub(super) fn permute<T: Copy, const N: usize>(data: &mut [T], order: &[usize; N
 }
 
 /// The weights of `weights`, in the order of the network's file.
-fn unpermuted_weights(weights: &[i8]) -> Vec<i8> {
+pub(super) fn unpermuted_weights(weights: &[i8]) -> Vec<i8> {
     let mut weights = weights.to_vec();
     #[cfg(use_paired_widening_add)]
     permute(&mut weights, &INVERSE_WIDENING_PAIR_ORDER);
@@ -137,7 +138,7 @@ pub struct FeatureTransformer {
 
 const _: () = assert!(PairFeatureSet::INDEX_BASE == ThreatFeatureSet::DIMENSIONS);
 
-const fn combine_hash(hashes: &[u32]) -> u32 {
+pub(super) const fn combine_hash(hashes: &[u32]) -> u32 {
     let mut hash = 0u32;
     let mut i = 0;
     while i < hashes.len() {
@@ -156,6 +157,13 @@ impl FeatureTransformer {
             PairFeatureSet::HASH_VALUE,
             PsqFeatureSet::HASH_VALUE,
         ]) ^ (OUTPUT_DIMENSIONS * 2) as u32
+    }
+
+    /// The weights of the piece-square features of a block
+    #[inline(always)]
+    pub fn psq_weights(&self, block: usize) -> &[i8] {
+        &self.weights.0[PsqFeatureSet::block_offset(block) * HALF_DIMENSIONS..]
+            [..PSQ_BLOCK_DIMENSIONS * HALF_DIMENSIONS]
     }
 
     fn permute_weights(&mut self) {
@@ -228,7 +236,7 @@ impl FeatureTransformer {
     /// Writes the half of `output` for perspective `p`: the products of the
     /// clipped pairs of the perspective's accumulation, divided by 512.
     #[inline(always)]
-    fn transform_perspective(
+    pub(super) fn transform_perspective(
         accumulation: &[i16; HALF_DIMENSIONS],
         output: &mut MaybeUninit<Aligned<[u8; OUTPUT_DIMENSIONS]>>,
         perspective: usize,
@@ -408,6 +416,6 @@ mod tests {
 
     #[test]
     fn the_hash_matches_the_default_network() {
-        assert_eq!(FeatureTransformer::get_hash_value(), 0x86fe_fd2f);
+        assert_eq!(FeatureTransformer::get_hash_value(), 0xa306_0b95);
     }
 }

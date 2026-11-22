@@ -7,7 +7,7 @@ pub mod atomic;
 pub(crate) mod common;
 pub mod eval_file;
 pub(crate) mod feature_transformer;
-pub(crate) mod features;
+pub mod features;
 pub(crate) mod layers;
 pub(crate) mod misc;
 pub mod network;
@@ -15,21 +15,24 @@ pub(crate) mod nnz_helper;
 pub(crate) mod simd;
 
 use crate::memory::LargePageBox;
+use crate::position::Position;
+use crate::variant::Variant;
 
-/// The accumulators of the positions along a search's line, which a move
-/// pushes, recording its changes in the dirties `push` returns, and its
-/// undoing pops.
-pub trait Accumulators: Sized + Send + 'static {
+/// The accumulators of the positions along a search's line of variant V,
+/// which a move pushes, recording its changes in the dirties `push` returns,
+/// and its undoing pops.
+pub trait Accumulators<V: Variant>: Sized + Send + 'static {
     type Dirties;
 
     /// A stack holding only the root.
     fn new() -> LargePageBox<Self>;
 
-    /// Empties the stack to the root, whose accumulations are computed anew.
-    fn reset(&mut self);
+    /// Empties the stack to the root, whose accumulations are computed anew,
+    /// for `network`, the network the search evaluates with, if loaded.
+    fn reset(&mut self, network: Option<&V::Network>);
 
-    /// Adds the state of the position after a move.
-    fn push(&mut self) -> &mut Self::Dirties;
+    /// Adds the state of the position after a move from `pos`.
+    fn push(&mut self, pos: &Position<V>) -> &mut Self::Dirties;
 
     fn pop(&mut self);
 }

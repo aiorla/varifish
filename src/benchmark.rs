@@ -114,6 +114,61 @@ pub const ATOMIC_DEFAULTS: &[&str] = &[
     "6k1/p7/6p1/3n3p/3P4/P7/1P3r2/7K w - - 0 1",                            // White is mated in 4
 ];
 
+#[rustfmt::skip]
+pub const THREE_CHECK_DEFAULTS: &[&str] = &[
+    "setoption name UCI_Chess960 value false",
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 3+3 0 1",
+    "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3+3 3 3",
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 3+3 0 10",
+    "r1bq1rk1/ppp1nppp/4n3/3p3Q/3P4/1BP1B3/PP1N2PP/R4RK1 w - - 2+3 1 16",
+    "r1b1k2r/ppppqppp/2n2n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 2+2 4 6",
+    "4rrk1/pp1n3p/3q2pQ/2p1pb2/2PP4/2P3N1/P2B2PP/4RRK1 b - - 1+3 7 19",
+    "r3r1k1/2p2ppp/p1p1bn2/8/1q2P3/2NPQN2/PPP3PP/R4RK1 b - - 2+1 2 15",
+    "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 1+2 4 4",
+    "3r1rk1/p5pp/bpp1pp2/8/q1PP1P2/b3P3/P2NQRPP/1R2B1K1 b - - 1+1 6 22",
+    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 2+2 0 11",
+    "6k1/6p1/6Pp/ppp5/3pn2P/1P3K2/1PP2P2/3N4 b - - 1+2 0 1",
+    "4k3/8/8/8/8/8/1Q6/4K3 w - - 1+3 0 1",
+    "setoption name UCI_Chess960 value true",
+    "bbqnnrkr/pppppppp/8/8/8/8/PPPPPPPP/BBQNNRKR w HFhf - 3+3 0 1",
+    "setoption name UCI_Chess960 value false",
+];
+
+#[rustfmt::skip]
+pub const CRAZYHOUSE_DEFAULTS: &[&str] = &[
+    "setoption name UCI_Chess960 value false",
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1",
+    "r1bqk2r/pppp1ppp/2n1p3/4P3/1b1Pn3/2NB1N2/PPP2PPP/R1BQK2R[] b KQkq - 0 1",
+    "r1bqkb1r/pppp1ppp/2n5/4p3/2B5/5N2/PPPP1PPP/RNBQK2R[Pn] w KQkq - 0 5",
+    "r2q1rk1/ppp2ppp/2n2n2/3p4/3P4/2NB1N2/PPP2PPP/R2Q1RK1[BBpp] w - - 0 10",
+    "r1b2rk1/pp2qppp/2n5/3p4/3P4/2P2N2/PP3PPP/R2Q1RK1[BNbnp] b - - 0 13",
+    "r4rk1/ppp2ppp/2n5/3q4/3P4/2N5/PPP2PPP/R2Q1RK1[BBNbbnp] w - - 0 15",
+    "2r2rk1/1p2qppp/p1n5/3p4/3P4/2P1PN2/P4PPP/2RQ1RK1[RNBbnpp] b - - 0 18",
+    "4r1k1/pp3ppp/2n1p3/3pQ~3/3P4/2NB1N2/PP3PPP/R4RK1[Brnp] b - - 0 22",
+    "2k5/8/8/8/8/8/8/4K3[Qn] w - - 0 1",
+    "r3k2r/ppp2ppp/2n5/3p4/3P4/2N5/PPP2PPP/R3K2R[QNbnpp] w KQkq - 0 12",
+    "setoption name UCI_Chess960 value true",
+    "bbqnnrkr/pppppppp/8/8/8/8/PPPPPPPP/BBQNNRKR[] w HFhf - 0 1",
+    "setoption name UCI_Chess960 value false",
+];
+
+#[rustfmt::skip]
+pub const ANTICHESS_DEFAULTS: &[&str] = &[
+    "setoption name UCI_Chess960 value false",
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1",
+    "rnbqkbnr/p1pppppp/8/1p6/8/4P3/PPPP1PPP/RNBQKBNR w - - 0 2",
+    "rnbqkbnr/pppp1ppp/4p3/8/8/4P3/PPPP1PPP/RNBQKBNR w - - 0 2",
+    "rnbqkbnr/pp1ppppp/8/2p5/8/4P3/PPPP1PPP/RNBQKBNR w - - 0 2",
+    "rnbqkbnr/p1pppppp/1p6/8/8/4P3/PPPP1PPP/RNBQKBNR w - - 0 2",
+    "rnbqkbnr/ppp1pppp/3p4/8/8/4P3/PPPP1PPP/RNBQKBNR w - - 0 2",
+    "rnbqkb1r/pppppppp/7n/8/8/4P3/PPPP1PPP/RNBQKBNR w - - 0 2",
+    "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w - - 0 3",
+    "2bqkbnr/pp1p1ppp/2n5/8/8/2P5/PP3PPP/RN2KB1R w - - 0 8",
+    "8/2p2p2/p2p4/1p2p3/4P3/2P2P2/PP4PP/8 w - - 0 20",
+    "4k3/1p6/8/3pP3/8/8/8/4K3 w - d6 0 1",
+    "8/4P3/8/8/8/8/6p1/8 w - - 0 1",
+];
+
 /// Builds a list of UCI commands to be run by bench, whose default
 /// positions are `defaults`. There are five parameters: TT size in MB,
 /// number of search threads that should be used, the limit value spent for
@@ -210,6 +265,30 @@ mod tests {
     fn the_atomic_bench_searches_19_positions() {
         let list = setup_bench(ATOMIC_DEFAULTS, "", &mut IStream::new("")).unwrap();
         assert_eq!(list.iter().filter(|cmd| *cmd == "go depth 13").count(), 19);
+        assert_eq!(
+            list.iter()
+                .filter(|cmd| cmd.starts_with("setoption"))
+                .count(),
+            2 + 3
+        );
+    }
+
+    #[test]
+    fn the_three_check_bench_searches_13_positions() {
+        let list = setup_bench(THREE_CHECK_DEFAULTS, "", &mut IStream::new("")).unwrap();
+        assert_eq!(list.iter().filter(|cmd| *cmd == "go depth 13").count(), 13);
+        assert_eq!(
+            list.iter()
+                .filter(|cmd| cmd.starts_with("setoption"))
+                .count(),
+            2 + 3
+        );
+    }
+
+    #[test]
+    fn the_crazyhouse_bench_searches_11_positions() {
+        let list = setup_bench(CRAZYHOUSE_DEFAULTS, "", &mut IStream::new("")).unwrap();
+        assert_eq!(list.iter().filter(|cmd| *cmd == "go depth 13").count(), 11);
         assert_eq!(
             list.iter()
                 .filter(|cmd| cmd.starts_with("setoption"))

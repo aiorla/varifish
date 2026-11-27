@@ -468,16 +468,11 @@ mod tests {
         assert!(Network::read(&bad).is_none());
         assert!(AtomicNetwork::read(&bad).is_none());
 
-        // Atomic's networks read both formats, and neither is chess's or
-        // the other's.
+        // Atomic's networks read it, and it is not chess's, nor chess's
+        // Atomic's.
         let (atomic, _) = AtomicNetwork::read(&file).expect("an Atomic network");
         assert!(matches!(*atomic, AtomicNetwork::Sfnnv20(_)));
         assert!(crate::nnue::network::Network::read(&file).is_none());
-        assert!(crate::nnue::atomic::network::Network::read(&file).is_none());
-        let legacy = crate::nnue::atomic::network::Network::zeroed().write(b"");
-        let (atomic, _) = AtomicNetwork::read(&legacy).expect("an Atomic network");
-        assert!(matches!(*atomic, AtomicNetwork::Legacy(_)));
-        assert!(Network::read(&legacy).is_none());
         let chess = crate::nnue::network::Network::zeroed_with_stacks(1).write(b"");
         assert!(Network::read(&chess).is_none());
         assert!(AtomicNetwork::read(&chess).is_none());

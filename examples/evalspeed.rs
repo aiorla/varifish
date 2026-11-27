@@ -15,8 +15,7 @@
 //! The walks are chess's, with the default network from nets/, where `make
 //! net` downloads it, unless EVALFILE names a network, of chess or of
 //! Atomic, whose variant they then walk. Atomic's walks take the network's
-//! output alone (`Use NNUE` pure), as Atomic-Stockfish's walk does, since
-//! varifish scales it by the material with its own tuned constants.
+//! output alone (`Use NNUE` pure), as Atomic-Stockfish's walk does.
 
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
@@ -26,13 +25,11 @@ use std::time::Instant;
 use varifish::evaluate::EVAL_FILE_DEFAULT_NAME;
 use varifish::misc::Prng;
 use varifish::movegen::{ALL, MoveList};
-use varifish::nnue::atomic::AtomicNetwork;
-use varifish::nnue::eval_file::{NetworkFile, UseNnue};
-use varifish::nnue::network::Network as ChessNetwork;
-use varifish::nnue::{Accumulators, Caches};
+use varifish::nnue::Accumulators;
+use varifish::nnue::eval_file::{Networks, UseNnue};
 use varifish::position::Position;
 use varifish::types::{BLACK, Move, WHITE};
-use varifish::variant::{Atomic, Chess, Variant};
+use varifish::variant::{Antichess, Atomic, Chess, Crazyhouse, ThreeCheck, Variant};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -45,12 +42,19 @@ fn main() -> ExitCode {
             .join("nets")
             .join(EVAL_FILE_DEFAULT_NAME),
     };
-    let bytes = std::fs::read(&path).unwrap_or_default();
+    let mut networks = Networks::default();
+    networks.load(Path::new(""), &path, &[]);
 
-    let result = if let Some((network, _)) = ChessNetwork::read(&bytes) {
-        walk::<Chess>(&network, plies, seed)
-    } else if let Some((network, _)) = AtomicNetwork::read(&bytes) {
-        walk::<Atomic>(&network, plies, seed)
+    let result = if networks.chess.network().is_some() {
+        walk::<Chess>(&networks, plies, seed)
+    } else if networks.atomic.network().is_some() {
+        walk::<Atomic>(&networks, plies, seed)
+    } else if networks.threecheck.network().is_some() {
+        walk::<ThreeCheck>(&networks, plies, seed)
+    } else if networks.crazyhouse.network().is_some() {
+        walk::<Crazyhouse>(&networks, plies, seed)
+    } else if networks.antichess.network().is_some() {
+        walk::<Antichess>(&networks, plies, seed)
     } else {
         Err(format!(
             "{} is not a network; make net downloads the default one",
@@ -71,13 +75,15 @@ fn main() -> ExitCode {
 fn evaluable<V: Variant>(pos: &Position<V>) -> bool {
     if V::ATOMIC {
         pos.has_king(WHITE) && pos.has_king(BLACK)
+    } else if V::THREE_CHECK {
+        !pos.is_three_check_over() && pos.checkers().is_empty()
     } else {
         pos.checkers().is_empty()
     }
 }
 
-fn walk<V: Variant>(network: &V::Network, plies: usize, seed: u64) -> Result<(), String> {
-    let mut caches = V::Caches::new(Some(network));
+fn walk<V: Variant>(networks: &Networks, plies: usize, seed: u64) -> Result<(), String> {
+    let mut caches = V::new_caches(networks);
     let mut accumulators = V::Accumulators::new();
 
     let mut rng = Prng::new(seed);
@@ -93,15 +99,14 @@ fn walk<V: Variant>(network: &V::Network, plies: usize, seed: u64) -> Result<(),
 
         let mut pos =
             Position::<V>::from_fen(&line[2..], line.starts_with('1')).map_err(|e| e.0)?;
-        accumulators.reset(Some(network));
+        accumulators.reset(V::eval_file(networks).network());
 
         let mut evaluate = |pos: &Position<V>, accumulators: &mut V::Accumulators| {
             let value = V::evaluate(
-                Some(network),
+                networks,
                 pos,
                 accumulators,
                 &mut caches,
-                0,
                 if V::ATOMIC {
                     UseNnue::Pure
                 } else {

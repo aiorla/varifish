@@ -104,39 +104,51 @@ impl<'a> IntoIterator for &'a MoveList {
 /// EVASIONS, of which the side to move must be in check for EVASIONS only,
 /// or ALL.
 #[inline]
-pub fn generate<const T: GenType>(pos: &Position, moves: &mut Moves) {
+pub fn generate<const T: GenType, V: Variant>(pos: &Position<V>, moves: &mut Moves) {
     if T == ALL {
         if pos.checkers().any() {
-            generate_all::<EVASIONS>(pos, moves);
+            generate_all::<EVASIONS, V>(pos, moves);
         } else {
-            generate_all::<CAPTURES>(pos, moves);
-            generate_all::<QUIETS>(pos, moves);
+            generate_all::<CAPTURES, V>(pos, moves);
+            generate_all::<QUIETS, V>(pos, moves);
         }
     } else {
         debug_assert!((T == EVASIONS) == pos.checkers().any());
-        generate_all::<T>(pos, moves);
+        generate_all::<T, V>(pos, moves);
     }
 }
 
 /// The pawn moves to the squares of `to_bb` from `offset` behind each. With
 /// Ice Lake's AVX-512, as Stockfish's avx512icl builds splat them, all in one
 /// vector store: the squares compressed, widened to the moves' 16 bits, and
-/// each origin made from its square.
+/// each origin made from its square. A side has at most 8 pawns, or 16 in
+/// Crazyhouse, whose drops add more.
 #[inline(always)]
-fn splat_pawn_moves(moves: &mut Moves, to_bb: Bitboard, offset: Direction) {
+#[cfg_attr(not(use_avx512icl), allow(clippy::extra_unused_type_parameters))]
+fn splat_pawn_moves<V: Variant>(moves: &mut Moves, to_bb: Bitboard, offset: Direction) {
     #[cfg(use_avx512icl)]
     {
         use std::arch::x86_64::*;
         // One move for each pawn of a side
-        debug_assert!(to_bb.popcount() <= 8);
         let count = to_bb.popcount() as usize;
         // SAFETY: the build targets Ice Lake's AVX-512, and the store writes
-        // eight moves, the first `count` those of `to_bb`.
+        // eight moves, or 16 in Crazyhouse, the first `count` those of
+        // `to_bb`.
         unsafe {
-            let to = _mm_cvtepi8_epi16(_mm512_castsi512_si128(compress_squares(to_bb)));
-            let from = _mm_sub_epi16(to, _mm_set1_epi16(offset as i16));
-            let m = _mm_or_si128(_mm_slli_epi16::<6>(from), to);
-            moves.extend_by_store(8, count, |p| _mm_storeu_si128(p.cast(), m));
+            let to = _mm512_castsi512_si128(compress_squares(to_bb));
+            if V::CRAZYHOUSE {
+                debug_assert!(count <= 16);
+                let to = _mm256_cvtepi8_epi16(to);
+                let from = _mm256_sub_epi16(to, _mm256_set1_epi16(offset as i16));
+                let m = _mm256_or_si256(_mm256_slli_epi16::<6>(from), to);
+                moves.extend_by_store(16, count, |p| _mm256_storeu_si256(p.cast(), m));
+            } else {
+                debug_assert!(count <= 8);
+                let to = _mm_cvtepi8_epi16(to);
+                let from = _mm_sub_epi16(to, _mm_set1_epi16(offset as i16));
+                let m = _mm_or_si128(_mm_slli_epi16::<6>(from), to);
+                moves.extend_by_store(8, count, |p| _mm_storeu_si128(p.cast(), m));
+            }
         }
     }
     #[cfg(not(use_avx512icl))]
@@ -192,8 +204,8 @@ fn make_promotions<const T: GenType, const ENEMY: bool>(
 
 /// The pawn moves of the side `US` (0 for White, 1 for Black) to `target`.
 #[inline(always)]
-fn generate_pawn_moves<const US: u8, const T: GenType>(
-    pos: &Position,
+fn generate_pawn_moves<const US: u8, const T: GenType, V: Variant>(
+    pos: &Position<V>,
     moves: &mut Moves,
     target: Bitboard,
 ) {
@@ -241,8 +253,8 @@ fn generate_pawn_moves<const US: u8, const T: GenType>(
             b2 &= target;
         }
 
-        splat_pawn_moves(moves, b1, up);
-        splat_pawn_moves(moves, b2, up + up);
+        splat_pawn_moves::<V>(moves, b1, up);
+        splat_pawn_moves::<V>(moves, b2, up + up);
     }
 
     // Promotions and underpromotions
@@ -273,8 +285,8 @@ fn generate_pawn_moves<const US: u8, const T: GenType>(
         let b1 = shift(pawns_not_on_7 & can_capture_right, up_right) & enemies;
         let b2 = shift(pawns_not_on_7 & can_capture_left, up_left) & enemies;
 
-        splat_pawn_moves(moves, b1, up_right);
-        splat_pawn_moves(moves, b2, up_left);
+        splat_pawn_moves::<V>(moves, b1, up_right);
+        splat_pawn_moves::<V>(moves, b2, up_left);
 
         let ep_sq = pos.ep_square();
 
@@ -297,7 +309,12 @@ fn generate_pawn_moves<const US: u8, const T: GenType>(
 /// The moves of the pieces of type `PT`, neither pawns nor kings, to
 /// `target`.
 #[inline(always)]
-fn generate_moves<const PT: u8>(pos: &Position, moves: &mut Moves, target: Bitboard, us: Color) {
+fn generate_moves<const PT: u8, V: Variant>(
+    pos: &Position<V>,
+    moves: &mut Moves,
+    target: Bitboard,
+    us: Color,
+) {
     let pt = PieceType(PT);
     debug_assert!(pt != KING && pt != PAWN);
 
@@ -319,7 +336,7 @@ fn generate_moves<const PT: u8>(pos: &Position, moves: &mut Moves, target: Bitbo
 }
 
 #[inline(always)]
-fn generate_all<const T: GenType>(pos: &Position, moves: &mut Moves) {
+fn generate_all<const T: GenType, V: Variant>(pos: &Position<V>, moves: &mut Moves) {
     debug_assert!(T != ALL);
 
     let us = pos.side_to_move();
@@ -337,14 +354,14 @@ fn generate_all<const T: GenType>(pos: &Position, moves: &mut Moves) {
         };
 
         if us == WHITE {
-            generate_pawn_moves::<{ WHITE.0 }, T>(pos, moves, target);
+            generate_pawn_moves::<{ WHITE.0 }, T, V>(pos, moves, target);
         } else {
-            generate_pawn_moves::<{ BLACK.0 }, T>(pos, moves, target);
+            generate_pawn_moves::<{ BLACK.0 }, T, V>(pos, moves, target);
         }
-        generate_moves::<{ KNIGHT.0 }>(pos, moves, target, us);
-        generate_moves::<{ BISHOP.0 }>(pos, moves, target, us);
-        generate_moves::<{ ROOK.0 }>(pos, moves, target, us);
-        generate_moves::<{ QUEEN.0 }>(pos, moves, target, us);
+        generate_moves::<{ KNIGHT.0 }, V>(pos, moves, target, us);
+        generate_moves::<{ BISHOP.0 }, V>(pos, moves, target, us);
+        generate_moves::<{ ROOK.0 }, V>(pos, moves, target, us);
+        generate_moves::<{ QUEEN.0 }, V>(pos, moves, target, us);
     }
 
     if T == EVASIONS {

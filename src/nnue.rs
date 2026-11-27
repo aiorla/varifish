@@ -2,9 +2,11 @@
 //! as Stockfish's, and Atomic's, as Atomic-Stockfish's.
 
 pub mod accumulator;
+pub mod antichess;
 pub(crate) mod architecture;
 pub mod atomic;
 pub(crate) mod common;
+pub mod crazyhouse;
 pub mod eval_file;
 pub(crate) mod feature_transformer;
 pub mod features;
@@ -13,6 +15,7 @@ pub(crate) mod misc;
 pub mod network;
 pub(crate) mod nnz_helper;
 pub(crate) mod simd;
+pub mod threecheck;
 
 use crate::memory::LargePageBox;
 use crate::position::Position;

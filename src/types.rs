@@ -466,11 +466,27 @@ pub const PROMOTION: MoveType = 1 << 14;
 pub const EN_PASSANT: MoveType = 2 << 14;
 pub const CASTLING: MoveType = 3 << 14;
 
+/// Crazyhouse drops use the unused `(0, 1)` tag in bits 14-15 / 12-13, storing
+/// the dropped `PieceType` (`PAWN..=QUEEN`) in bits 6-11 and `to` in bits 0-5.
+/// Normal moves always have bits 12-15 clear, so every drop is distinct from
+/// every board move, keeps `Move` at 16 bits, and gets its own `ButterflyHistory`
+/// slot.
+pub const DROP_MASK: u16 = 0xF000;
+pub const DROP_TAG: u16 = 1 << 12;
+
+/// Antichess king promotions use the unused `(0, 2)` tag in bits 14-15 / 12-13,
+/// storing `from` in bits 6-11 and `to` in bits 0-5. Every king promotion is
+/// distinct from normal moves, Crazyhouse drops, and N/B/R/Q promotions, keeps
+/// `Move` at 16 bits, and gets its own `ButterflyHistory` slot.
+pub const KING_PROMO_MASK: u16 = 0xF000;
+pub const KING_PROMO_TAG: u16 = 2 << 12;
+
 /// A move in 16 bits:
 ///
 /// - bits 0-5: destination square (from 0 to 63)
-/// - bits 6-11: origin square (from 0 to 63)
-/// - bits 12-13: promotion piece type - 2 (from KNIGHT-2 to QUEEN-2)
+/// - bits 6-11: origin square (from 0 to 63), or dropped piece type for drops
+/// - bits 12-13: promotion piece type - 2 (from KNIGHT-2 to QUEEN-2), 1 for
+///   Crazyhouse drops, or 2 for Antichess king promotions (with bits 14-15 clear)
 /// - bits 14-15: special move flag: promotion (1), en passant (2), castling (3)
 ///
 /// Castling is encoded as the king capturing its own rook. `Move::none()`
@@ -494,6 +510,35 @@ impl Move {
     #[inline(always)]
     pub const fn make(mt: MoveType, from: Square, to: Square, pt: PieceType) -> Move {
         Move(mt + (((pt.0 - KNIGHT.0) as u16) << 12) + ((from.0 as u16) << 6) + to.0 as u16)
+    }
+
+    /// An Antichess pawn promotion to king from `from` to `to`.
+    #[inline(always)]
+    pub const fn make_king_promotion(from: Square, to: Square) -> Move {
+        Move(KING_PROMO_TAG | ((from.0 as u16) << 6) | to.0 as u16)
+    }
+
+    #[inline(always)]
+    pub const fn is_king_promotion(self) -> bool {
+        (self.0 & KING_PROMO_MASK) == KING_PROMO_TAG
+    }
+
+    /// A Crazyhouse drop of piece type `pt` (`PAWN..=QUEEN`) onto `to`.
+    #[inline(always)]
+    pub const fn make_drop(to: Square, pt: PieceType) -> Move {
+        debug_assert!(pt.0 >= PAWN.0 && pt.0 <= QUEEN.0);
+        Move(DROP_TAG | ((pt.0 as u16) << 6) | to.0 as u16)
+    }
+
+    #[inline(always)]
+    pub const fn is_drop(self) -> bool {
+        (self.0 & DROP_MASK) == DROP_TAG
+    }
+
+    #[inline(always)]
+    pub const fn dropped_piece_type(self) -> PieceType {
+        debug_assert!(self.is_drop());
+        PieceType(((self.0 >> 6) & 0x3F) as u8)
     }
 
     #[inline(always)]
@@ -696,9 +741,9 @@ impl Blast {
 pub const MAX_ATOMIC_DIRTY_THREATS: usize = 512;
 pub type AtomicDirtyThreats = ValueList<DirtyThreat, MAX_ATOMIC_DIRTY_THREATS>;
 
-/// The list an Atomic move records the threats it changes in, when the
-/// network searched with has threat features: one that the accumulator
-/// state pushed for the move holds beside its `AtomicDirties`, or none.
+/// The list an Atomic move records the threats it changes in, when a
+/// search's accumulators follow it: one that the accumulator state pushed
+/// for the move holds beside its `AtomicDirties`, or none.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct ThreatRecord(Option<std::ptr::NonNull<AtomicDirtyThreats>>);
 

@@ -14,8 +14,10 @@ use crate::position::Position;
 use crate::types::*;
 use crate::uci::to_cp;
 
+use crate::variant::Variant;
+
 /// Converts a Value into pawns, always keeping two decimals
-fn format_cp_aligned_dot(v: Value, out: &mut String, pos: &Position) {
+fn format_cp_aligned_dot<V: Variant>(v: Value, out: &mut String, pos: &Position<V>) {
     let pawns = (0.01 * f64::from(to_cp(v, pos))).abs();
     let sign = match v {
         ..0 => '-',
@@ -25,14 +27,13 @@ fn format_cp_aligned_dot(v: Value, out: &mut String, pos: &Position) {
     let _ = write!(out, "{sign}{pawns:6.2}");
 }
 
-/// Returns a string with the table for evaluation values bucket by bucket.
-pub fn trace(pos: &Position, network: &Network, caches: &mut AccumulatorCaches) -> String {
+/// Formats a table of layer-stack evaluations for `pos`.
+pub fn format_trace<V: Variant>(
+    pos: &Position<V>,
+    positional: &[Value],
+    correct_bucket: usize,
+) -> String {
     let mut ss = String::new();
-
-    let mut accumulators = AccumulatorStack::new();
-    accumulators.reset();
-
-    let t = network.trace_evaluate(pos, &mut accumulators, caches);
 
     ss += "NNUE network contributions (Normalized, ";
     ss += if pos.side_to_move() == WHITE {
@@ -44,11 +45,11 @@ pub fn trace(pos: &Position, network: &Network, caches: &mut AccumulatorCaches) 
     ss += "|   Bucket   | Evaluation |\n";
     ss += "+------------+------------+\n";
 
-    for bucket in 0..t.layer_stacks {
+    for (bucket, &value) in positional.iter().enumerate() {
         let _ = write!(ss, "|  {bucket:<10}|  ");
-        format_cp_aligned_dot(t.positional[bucket], &mut ss, pos);
+        format_cp_aligned_dot(value, &mut ss, pos);
         ss += "   |";
-        if bucket == t.correct_bucket {
+        if bucket == correct_bucket {
             ss += " <-- this bucket is used";
         }
         ss.push('\n');
@@ -57,4 +58,17 @@ pub fn trace(pos: &Position, network: &Network, caches: &mut AccumulatorCaches) 
     ss += "+------------+------------+\n";
 
     ss
+}
+
+/// Returns a string with the table for evaluation values bucket by bucket.
+pub fn trace<V: Variant>(
+    pos: &Position<V>,
+    network: &Network,
+    caches: &mut AccumulatorCaches,
+) -> String {
+    let mut accumulators = AccumulatorStack::new();
+    accumulators.reset();
+
+    let t = network.trace_evaluate(pos, &mut accumulators, caches);
+    format_trace(pos, &t.positional[..t.layer_stacks], t.correct_bucket)
 }

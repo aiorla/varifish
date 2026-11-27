@@ -269,7 +269,11 @@ fn append_changed_indices_impl<const N: usize, const M: usize>(
     );
 }
 
-pub fn append_active_indices(perspective: Color, pos: &Position, active: &mut IndexList) {
+pub fn append_active_indices<V: crate::variant::Variant>(
+    perspective: Color,
+    pos: &Position<V>,
+    active: &mut IndexList,
+) {
     let white = pos.pieces_cpt(WHITE, PAWN);
     let black = pos.pieces_cpt(BLACK, PAWN);
     append_indices_impl(

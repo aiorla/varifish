@@ -217,7 +217,11 @@ pub fn make_index(
 }
 
 /// Get a list of indices for active features
-pub fn append_active_indices(perspective: Color, pos: &Position, active: &mut IndexList) {
+pub fn append_active_indices<V: Variant>(
+    perspective: Color,
+    pos: &Position<V>,
+    active: &mut IndexList,
+) {
     let ksq = pos.king_square(perspective);
     let occupied = pos.pieces();
     let pawn_targets = pos.pieces_pt2(KNIGHT, ROOK);
@@ -271,9 +275,9 @@ pub fn append_active_indices(perspective: Color, pos: &Position, active: &mut In
 }
 
 #[inline(always)]
-fn append_piece_threats(
+fn append_piece_threats<V: Variant>(
     perspective: Color,
-    pos: &Position,
+    pos: &Position<V>,
     attacker: Piece,
     targets: Bitboard,
     occupied: Bitboard,

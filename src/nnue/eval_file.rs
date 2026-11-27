@@ -13,8 +13,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::antichess::AntichessNetwork;
 use super::atomic::AtomicNetwork;
+use super::crazyhouse::CrazyhouseNetwork;
 use super::network::Network as ChessNetwork;
+use super::threecheck::ThreeCheckNetwork;
 use crate::memory::LargePageBox;
 
 /// A network as its file holds it.
@@ -191,7 +194,7 @@ impl<N: NetworkFile> EvalFile<N> {
 
 /// How Atomic is evaluated, as Atomic-Stockfish's "Use NNUE" chooses: by
 /// the network as Fairy-Stockfish trained it, or by the network's output
-/// alone, for generating training data. Chess always uses its network.
+/// alone. Chess always uses its network.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UseNnue {
     #[default]
@@ -222,23 +225,35 @@ impl UseNnue {
 pub struct Networks {
     pub chess: EvalFile<ChessNetwork>,
     pub atomic: EvalFile<AtomicNetwork>,
+    pub threecheck: EvalFile<ThreeCheckNetwork>,
+    pub crazyhouse: EvalFile<CrazyhouseNetwork>,
+    pub antichess: EvalFile<AntichessNetwork>,
 }
 
 impl Networks {
+    const DEFAULTS: [&'static str; 5] = [
+        ChessNetwork::DEFAULT_NAME,
+        AtomicNetwork::DEFAULT_NAME,
+        ThreeCheckNetwork::DEFAULT_NAME,
+        CrazyhouseNetwork::DEFAULT_NAME,
+        AntichessNetwork::DEFAULT_NAME,
+    ];
+
     /// Loads the network or networks EvalFile names, as EvalFile::load does,
     /// into the variant whose network the file holds: if EvalFile is empty,
     /// each variant's default network, and otherwise the file named, which
-    /// is read once for both.
+    /// is read once for all variants.
     pub fn load(&mut self, root_directory: &Path, eval_file_path: &Path, embedded: &[u8]) {
         if eval_file_path.as_os_str().is_empty() {
             self.chess.load(root_directory, eval_file_path, embedded);
             self.atomic.load(root_directory, eval_file_path, &[]);
+            self.threecheck.load(root_directory, eval_file_path, &[]);
+            self.crazyhouse.load(root_directory, eval_file_path, &[]);
+            self.antichess.load(root_directory, eval_file_path, &[]);
             return;
         }
 
-        let loaded = |networks: &Networks| {
-            networks.chess.is_current(eval_file_path) || networks.atomic.is_current(eval_file_path)
-        };
+        let loaded = |networks: &Networks| networks.is_any_current(eval_file_path);
 
         if !loaded(self) && eval_file_path == Path::new(ChessNetwork::DEFAULT_NAME) {
             self.chess.load_bytes(eval_file_path, embedded);
@@ -250,9 +265,20 @@ impl Networks {
                 if let Ok(bytes) = fs::read(directory.join(eval_file_path)) {
                     self.chess.load_bytes(eval_file_path, &bytes);
                     self.atomic.load_bytes(eval_file_path, &bytes);
+                    self.threecheck.load_bytes(eval_file_path, &bytes);
+                    self.crazyhouse.load_bytes(eval_file_path, &bytes);
+                    self.antichess.load_bytes(eval_file_path, &bytes);
                 }
             }
         }
+    }
+
+    fn is_any_current(&self, path: &Path) -> bool {
+        self.chess.is_current(path)
+            || self.atomic.is_current(path)
+            || self.threecheck.is_current(path)
+            || self.crazyhouse.is_current(path)
+            || self.antichess.is_current(path)
     }
 
     /// Checks that the network EvalFile names is loaded, and that the
@@ -266,8 +292,7 @@ impl Networks {
         eval_file: &EvalFile<N>,
         eval_file_path: &Path,
     ) -> Result<String, String> {
-        let defaults = [ChessNetwork::DEFAULT_NAME, AtomicNetwork::DEFAULT_NAME];
-        let requested = if defaults
+        let requested = if Self::DEFAULTS
             .iter()
             .any(|&name| eval_file_path == Path::new(name))
         {
@@ -275,7 +300,7 @@ impl Networks {
         } else {
             EvalFile::<N>::requested(eval_file_path)
         };
-        if !self.chess.is_current(requested) && !self.atomic.is_current(requested) {
+        if !self.is_any_current(requested) {
             return Err(EvalFile::<N>::not_loaded(requested));
         }
         if eval_file.network().is_none() {
@@ -283,6 +308,70 @@ impl Networks {
         }
 
         Ok(eval_file.describe())
+    }
+
+    /// Verifies a variant's network that can fall back to chess's network as a
+    /// bootstrap before its own dedicated network is loaded, saying where its
+    /// own network can be downloaded, as the bootstrap plays far weaker.
+    fn verify_with_chess_bootstrap<N: NetworkFile>(
+        &self,
+        eval_file: &EvalFile<N>,
+        eval_file_path: &Path,
+        label: &str,
+    ) -> Result<String, String> {
+        let is_default = eval_file_path.as_os_str().is_empty()
+            || Self::DEFAULTS
+                .iter()
+                .any(|&name| eval_file_path == Path::new(name));
+        if !is_default && !self.is_any_current(eval_file_path) {
+            return Err(EvalFile::<N>::not_loaded(eval_file_path));
+        }
+        if eval_file.network().is_some() {
+            return Ok(eval_file.describe());
+        }
+        if self.chess.network().is_some() {
+            return Ok(format!(
+                "{} ({label} bootstrap; for {label}'s own network, save {} from {} next to the engine)",
+                self.chess.describe(),
+                N::DEFAULT_NAME,
+                N::download_url()
+            ));
+        }
+        Err(EvalFile::<N>::not_loaded(Path::new(N::DEFAULT_NAME)))
+    }
+
+    /// Verifies Three-check's network: uses a dedicated Three-check network
+    /// when loaded, or falls back to the loaded chess network as a bootstrap.
+    pub fn verify_threecheck(&self, eval_file_path: &Path) -> Result<String, String> {
+        self.verify_with_chess_bootstrap(&self.threecheck, eval_file_path, "Three-check")
+    }
+
+    /// Verifies Crazyhouse's network: uses a dedicated Crazyhouse network
+    /// when loaded, or falls back to the loaded chess network as a bootstrap.
+    pub fn verify_crazyhouse(&self, eval_file_path: &Path) -> Result<String, String> {
+        self.verify_with_chess_bootstrap(&self.crazyhouse, eval_file_path, "Crazyhouse")
+    }
+
+    /// Verifies Antichess's network: uses a dedicated Antichess network when
+    /// loaded, or falls back to its classical bootstrap evaluation, far
+    /// weaker, when EvalFile is empty or names a default network, saying
+    /// where its own network can be downloaded.
+    pub fn verify_antichess(&self, eval_file_path: &Path) -> Result<String, String> {
+        let is_default = eval_file_path.as_os_str().is_empty()
+            || Self::DEFAULTS
+                .iter()
+                .any(|&name| eval_file_path == Path::new(name));
+        if !is_default && !self.is_any_current(eval_file_path) {
+            return Err(EvalFile::<AntichessNetwork>::not_loaded(eval_file_path));
+        }
+        if self.antichess.network().is_some() {
+            return Ok(self.antichess.describe());
+        }
+        Ok(format!(
+            "Classical evaluation (Antichess bootstrap; for Antichess's own network, save {} from {} next to the engine)",
+            AntichessNetwork::DEFAULT_NAME,
+            AntichessNetwork::download_url()
+        ))
     }
 }
 
@@ -305,7 +394,7 @@ mod tests {
         .unwrap();
         fs::write(
             &atomic_file,
-            crate::nnue::atomic::network::Network::zeroed().write(b"atomic"),
+            crate::nnue::atomic::sfnnv20::Network::zeroed(1).write(b"atomic"),
         )
         .unwrap();
 

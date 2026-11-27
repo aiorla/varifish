@@ -28,7 +28,7 @@ use crate::syzygy::{ProbeState, SyzygyOptions};
 use crate::thread::ThreadPool;
 use crate::types::*;
 use crate::uci::to_move;
-use crate::variant::{Atomic, Chess, Variant, VariantKind};
+use crate::variant::{Antichess, Atomic, Chess, Crazyhouse, ThreeCheck, Variant, VariantKind};
 
 /// The largest transposition table, in MB
 pub const MAX_HASH_MB: i32 = if cfg!(target_pointer_width = "64") {
@@ -83,6 +83,9 @@ impl<V: Variant> Game<V> {
 enum AnyGame {
     Chess(Game<Chess>),
     Atomic(Game<Atomic>),
+    ThreeCheck(Game<ThreeCheck>),
+    Crazyhouse(Game<Crazyhouse>),
+    Antichess(Game<Antichess>),
 }
 
 /// Evaluates `$body` with `$g` bound to the game, whatever its variant, so
@@ -92,6 +95,9 @@ macro_rules! with_game {
         match $game {
             AnyGame::Chess($g) => $body,
             AnyGame::Atomic($g) => $body,
+            AnyGame::ThreeCheck($g) => $body,
+            AnyGame::Crazyhouse($g) => $body,
+            AnyGame::Antichess($g) => $body,
         }
     };
 }
@@ -101,6 +107,9 @@ impl AnyGame {
         match variant {
             VariantKind::Chess => AnyGame::Chess(Game::new(chess960)),
             VariantKind::Atomic => AnyGame::Atomic(Game::new(chess960)),
+            VariantKind::ThreeCheck => AnyGame::ThreeCheck(Game::new(chess960)),
+            VariantKind::Crazyhouse => AnyGame::Crazyhouse(Game::new(chess960)),
+            VariantKind::Antichess => AnyGame::Antichess(Game::new(chess960)),
         }
     }
 
@@ -108,6 +117,9 @@ impl AnyGame {
         match self {
             AnyGame::Chess(_) => VariantKind::Chess,
             AnyGame::Atomic(_) => VariantKind::Atomic,
+            AnyGame::ThreeCheck(_) => VariantKind::ThreeCheck,
+            AnyGame::Crazyhouse(_) => VariantKind::Crazyhouse,
+            AnyGame::Antichess(_) => VariantKind::Antichess,
         }
     }
 }
@@ -398,7 +410,7 @@ impl Engine {
     fn verify_network_of<V: Variant>(&self, _game: &Game<V>) -> Result<(), CriticalError> {
         let file = PathBuf::from(self.options.get("EvalFile").as_str());
         let networks = &self.shared.networks;
-        match networks.verify(V::eval_file(networks), &file) {
+        match V::verify_network(networks, &file) {
             Ok(info) => {
                 (self.on_verify_network)(&info);
                 // The network is not shared between processes.
@@ -448,8 +460,10 @@ impl Engine {
 
         self.verify_network()?;
 
-        let network = V::eval_file(&self.shared.networks).network();
-        Ok(format!("\n{}", V::trace(network, &p, self.use_nnue())))
+        Ok(format!(
+            "\n{}",
+            V::trace(&self.shared.networks, &p, self.use_nnue())
+        ))
     }
 
     pub fn options(&self) -> &OptionsMap {

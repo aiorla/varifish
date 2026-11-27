@@ -1479,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn other_networks_record_no_threats() {
+    fn moves_without_accumulators_record_no_threats() {
         let mut pos = Position::<Atomic>::from_fen(STARTS[13].0, false).unwrap();
         let m = crate::uci::to_move(&pos, "d3d6");
         let mut dirties = AtomicDirties::default();

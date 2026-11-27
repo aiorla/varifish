@@ -101,9 +101,14 @@ impl AccumulatorCaches {
     }
 
     pub fn clear(&mut self, network: &Network) {
+        self.clear_with_biases(&network.feature_transformer.biases.0);
+    }
+
+    /// Empties the caches with the given feature-transformer biases.
+    pub fn clear_with_biases(&mut self, biases: &[i16; L1]) {
         for entries in self.entries.as_flattened_mut() {
             for entry in entries {
-                entry.clear(&network.feature_transformer.biases.0);
+                entry.clear(biases);
             }
         }
     }
@@ -149,7 +154,7 @@ impl AccumulatorStack {
     /// Adds the state of the position after a move from `pos`, whose
     /// changes the move records in the dirties returned.
     #[inline(always)]
-    pub fn push(&mut self, pos: &Position) -> &mut Dirties {
+    pub fn push<V: crate::variant::Variant>(&mut self, pos: &Position<V>) -> &mut Dirties {
         debug_assert!(self.size < Self::MAX_SIZE);
         let st = &mut self.accumulators[self.size];
         st.computed = [false; COLOR_NB];
@@ -166,9 +171,9 @@ impl AccumulatorStack {
     }
 
     /// Brings the latest state up to date for both perspectives.
-    pub fn evaluate(
+    pub fn evaluate<V: crate::variant::Variant>(
         &mut self,
-        pos: &Position,
+        pos: &Position<V>,
         feature_transformer: &FeatureTransformer,
         cache: &mut AccumulatorCaches,
     ) {
@@ -185,10 +190,10 @@ impl AccumulatorStack {
         }
     }
 
-    fn evaluate_side(
+    fn evaluate_side<V: crate::variant::Variant>(
         &mut self,
         perspective: Color,
-        pos: &Position,
+        pos: &Position<V>,
         feature_transformer: &FeatureTransformer,
         cache: &mut AccumulatorCaches,
         last_usable_accum: usize,
@@ -249,7 +254,11 @@ impl AccumulatorStack {
     /// Find the earliest usable accumulator, this can either be a computed
     /// accumulator or the accumulator state just after a change that
     /// requires full refresh.
-    fn find_last_usable_accumulator(&self, perspective: Color, pos: &Position) -> usize {
+    fn find_last_usable_accumulator<V: crate::variant::Variant>(
+        &self,
+        perspective: Color,
+        pos: &Position<V>,
+    ) -> usize {
         // All traversed states must use the current block.
         let psq_block = k32h3::block_of(pos, perspective);
 
@@ -271,10 +280,10 @@ impl AccumulatorStack {
         0
     }
 
-    fn forward_update_incremental(
+    fn forward_update_incremental<V: crate::variant::Variant>(
         &mut self,
         perspective: Color,
-        pos: &Position,
+        pos: &Position<V>,
         feature_transformer: &FeatureTransformer,
         begin: usize,
     ) {
@@ -286,7 +295,7 @@ impl AccumulatorStack {
 
         for next in begin + 1..self.size {
             let (target, computed) = target_and_source(&mut self.accumulators, next, next - 1);
-            update_accumulator_incremental::<true>(
+            update_accumulator_incremental::<true, V>(
                 perspective,
                 feature_transformer,
                 ksq,
@@ -299,10 +308,10 @@ impl AccumulatorStack {
         debug_assert!(self.latest().computed[perspective.idx()]);
     }
 
-    fn backward_update_incremental(
+    fn backward_update_incremental<V: crate::variant::Variant>(
         &mut self,
         perspective: Color,
-        pos: &Position,
+        pos: &Position<V>,
         feature_transformer: &FeatureTransformer,
         end: usize,
     ) {
@@ -314,7 +323,7 @@ impl AccumulatorStack {
 
         for next in (end..self.size - 1).rev() {
             let (target, computed) = target_and_source(&mut self.accumulators, next, next + 1);
-            update_accumulator_incremental::<false>(
+            update_accumulator_incremental::<false, V>(
                 perspective,
                 feature_transformer,
                 ksq,
@@ -327,9 +336,9 @@ impl AccumulatorStack {
         debug_assert!(self.accumulators[end].computed[perspective.idx()]);
     }
 
-    fn forward_update_incremental_both(
+    fn forward_update_incremental_both<V: crate::variant::Variant>(
         &mut self,
-        pos: &Position,
+        pos: &Position<V>,
         feature_transformer: &FeatureTransformer,
         white_begin: usize,
         black_begin: usize,
@@ -349,7 +358,7 @@ impl AccumulatorStack {
         // once.
         for next in white_begin + 1..=shared_begin {
             let (target, computed) = target_and_source(&mut self.accumulators, next, next - 1);
-            update_accumulator_incremental::<true>(
+            update_accumulator_incremental::<true, V>(
                 WHITE,
                 feature_transformer,
                 white_ksq,
@@ -360,7 +369,7 @@ impl AccumulatorStack {
         }
         for next in black_begin + 1..=shared_begin {
             let (target, computed) = target_and_source(&mut self.accumulators, next, next - 1);
-            update_accumulator_incremental::<true>(
+            update_accumulator_incremental::<true, V>(
                 BLACK,
                 feature_transformer,
                 black_ksq,
@@ -372,7 +381,7 @@ impl AccumulatorStack {
 
         for next in shared_begin + 1..self.size {
             let (target, computed) = target_and_source(&mut self.accumulators, next, next - 1);
-            update_accumulator_incremental_both(
+            update_accumulator_incremental_both::<V>(
                 feature_transformer,
                 white_ksq,
                 black_ksq,
@@ -417,6 +426,54 @@ impl crate::nnue::Accumulators<crate::variant::Chess> for AccumulatorStack {
 
     #[inline(always)]
     fn push(&mut self, pos: &Position) -> &mut Dirties {
+        AccumulatorStack::push(self, pos)
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) {
+        AccumulatorStack::pop(self);
+    }
+}
+
+impl crate::nnue::Accumulators<crate::variant::ThreeCheck> for AccumulatorStack {
+    type Dirties = Dirties;
+
+    #[inline(always)]
+    fn new() -> LargePageBox<Self> {
+        AccumulatorStack::new()
+    }
+
+    #[inline(always)]
+    fn reset(&mut self, _network: Option<&super::threecheck::ThreeCheckNetwork>) {
+        AccumulatorStack::reset(self);
+    }
+
+    #[inline(always)]
+    fn push(&mut self, pos: &Position<crate::variant::ThreeCheck>) -> &mut Dirties {
+        AccumulatorStack::push(self, pos)
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) {
+        AccumulatorStack::pop(self);
+    }
+}
+
+impl crate::nnue::Accumulators<crate::variant::Crazyhouse> for AccumulatorStack {
+    type Dirties = Dirties;
+
+    #[inline(always)]
+    fn new() -> LargePageBox<Self> {
+        AccumulatorStack::new()
+    }
+
+    #[inline(always)]
+    fn reset(&mut self, _network: Option<&super::crazyhouse::CrazyhouseNetwork>) {
+        AccumulatorStack::reset(self);
+    }
+
+    #[inline(always)]
+    fn push(&mut self, pos: &Position<crate::variant::Crazyhouse>) -> &mut Dirties {
         AccumulatorStack::push(self, pos)
     }
 
@@ -894,8 +951,7 @@ fn apply_combined_counted<const REMOVED: usize, const ADDED: usize>(
     thr_removed: &ThreatIndexList,
     psq_weights: &[i8],
 ) {
-    const { assert!(REMOVED == 1 || REMOVED == 2) };
-    const { assert!(ADDED == 1 || ADDED == 2) };
+    const { assert!(REMOVED <= 2 && ADDED <= 2) };
 
     let from = from_acc.as_ptr();
     let to = to_acc.as_mut_ptr();
@@ -928,9 +984,10 @@ fn apply_combined_counted<const REMOVED: usize, const ADDED: usize>(
 }
 
 /// An incremental update of one perspective's accumulation, which removes
-/// and adds one or two piece-square rows each.
+/// and adds one or two piece-square rows each (or (0, 1) / (1, 0) for a
+/// Crazyhouse drop).
 #[allow(clippy::too_many_arguments)]
-fn apply_combined(
+fn apply_combined<V: crate::variant::Variant>(
     feature_transformer: &FeatureTransformer,
     from_acc: &[i16; DIMENSIONS],
     to_acc: &mut [i16; DIMENSIONS],
@@ -940,8 +997,12 @@ fn apply_combined(
     thr_removed: &ThreatIndexList,
     psq_weights: &[i8],
 ) {
-    debug_assert!(psq_removed.len() == 1 || psq_removed.len() == 2);
-    debug_assert!(psq_added.len() == 1 || psq_added.len() == 2);
+    debug_assert!(if V::CRAZYHOUSE {
+        psq_removed.len() <= 2 && psq_added.len() <= 2
+    } else {
+        (psq_removed.len() == 1 || psq_removed.len() == 2)
+            && (psq_added.len() == 1 || psq_added.len() == 2)
+    });
     debug_assert!(
         psq_removed
             .iter()
@@ -957,11 +1018,22 @@ fn apply_combined(
 
     // Dispatch once; feature counts and row addresses stay fixed across
     // tiles.
-    let apply = match (psq_removed.len(), psq_added.len()) {
-        (1, 1) => apply_combined_counted::<1, 1>,
-        (1, _) => apply_combined_counted::<1, 2>,
-        (_, 1) => apply_combined_counted::<2, 1>,
-        _ => apply_combined_counted::<2, 2>,
+    let apply = if V::CRAZYHOUSE {
+        match (psq_removed.len(), psq_added.len()) {
+            (0, 1) => apply_combined_counted::<0, 1>,
+            (1, 0) => apply_combined_counted::<1, 0>,
+            (1, 1) => apply_combined_counted::<1, 1>,
+            (1, _) => apply_combined_counted::<1, 2>,
+            (_, 1) => apply_combined_counted::<2, 1>,
+            _ => apply_combined_counted::<2, 2>,
+        }
+    } else {
+        match (psq_removed.len(), psq_added.len()) {
+            (1, 1) => apply_combined_counted::<1, 1>,
+            (1, _) => apply_combined_counted::<1, 2>,
+            (_, 1) => apply_combined_counted::<2, 1>,
+            _ => apply_combined_counted::<2, 2>,
+        }
     };
     apply(
         feature_transformer,
@@ -975,7 +1047,8 @@ fn apply_combined(
     );
 }
 
-fn update_accumulator_incremental<const FORWARD: bool>(
+#[inline(always)]
+fn update_accumulator_incremental<const FORWARD: bool, V: crate::variant::Variant>(
     perspective: Color,
     feature_transformer: &FeatureTransformer,
     ksq: Square,
@@ -1040,9 +1113,9 @@ fn update_accumulator_incremental<const FORWARD: bool>(
         threat_pp_base,
         pf_stride,
     );
-    k32h3::append_changed_indices(perspective, ksq, &dirties.dirty_piece, psq_out, psq_in);
+    k32h3::append_changed_indices::<V>(perspective, ksq, &dirties.dirty_piece, psq_out, psq_in);
 
-    apply_combined(
+    apply_combined::<V>(
         feature_transformer,
         &computed.accumulation[p],
         &mut target_state.accumulation[p],
@@ -1056,7 +1129,8 @@ fn update_accumulator_incremental<const FORWARD: bool>(
     target_state.computed[p] = true;
 }
 
-fn update_accumulator_incremental_both(
+#[inline(always)]
+fn update_accumulator_incremental_both<V: crate::variant::Variant>(
     feature_transformer: &FeatureTransformer,
     white_ksq: Square,
     black_ksq: Square,
@@ -1107,7 +1181,7 @@ fn update_accumulator_incremental_both(
     }
     for (perspective, ksq) in [(WHITE, white_ksq), (BLACK, black_ksq)] {
         let p = perspective.idx();
-        k32h3::append_changed_indices(
+        k32h3::append_changed_indices::<V>(
             perspective,
             ksq,
             &dirties.dirty_piece,
@@ -1117,7 +1191,7 @@ fn update_accumulator_incremental_both(
     }
 
     for (p, psq_block) in [(WHITE.idx(), white_block), (BLACK.idx(), black_block)] {
-        apply_combined(
+        apply_combined::<V>(
             feature_transformer,
             &computed.accumulation[p],
             &mut target_state.accumulation[p],
@@ -1251,9 +1325,9 @@ pub(super) fn append_changed_psq_indices(
 
 /// Updates accumulator for a king move, and also updates the accumulator
 /// cache for the new king position.
-fn update_accumulator_hybrid(
+fn update_accumulator_hybrid<V: crate::variant::Variant>(
     perspective: Color,
-    pos: &Position,
+    pos: &Position<V>,
     feature_transformer: &FeatureTransformer,
     target: &mut AccumulatorState,
     computed: &AccumulatorState,
@@ -1400,10 +1474,10 @@ fn update_accumulator_hybrid(
 
 /// HalfKA data comes from the Finny table entry, while the threats are
 /// built from the active threat features
-fn update_accumulator_refresh_cache(
+fn update_accumulator_refresh_cache<V: crate::variant::Variant>(
     perspective: Color,
     feature_transformer: &FeatureTransformer,
-    pos: &Position,
+    pos: &Position<V>,
     accumulator: &mut AccumulatorState,
     cache: &mut AccumulatorCaches,
 ) {

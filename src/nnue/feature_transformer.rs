@@ -211,9 +211,9 @@ impl FeatureTransformer {
 
     /// Convert input features: writes `output` and returns it.
     #[inline(always)]
-    pub fn transform<'a>(
+    pub fn transform<'a, V: crate::variant::Variant>(
         &self,
-        pos: &Position,
+        pos: &Position<V>,
         accumulator_stack: &mut AccumulatorStack,
         cache: &mut AccumulatorCaches,
         output: &'a mut MaybeUninit<Aligned<[u8; OUTPUT_DIMENSIONS]>>,
@@ -226,7 +226,46 @@ impl FeatureTransformer {
         let accumulation = &accumulator_state.accumulation;
 
         for (p, perspective) in perspectives.into_iter().enumerate() {
-            Self::transform_perspective(&accumulation[perspective.idx()], output, p, nnz_info);
+            Self::transform_perspective_impl::<false>(
+                &accumulation[perspective.idx()],
+                None,
+                output,
+                p,
+                nnz_info,
+            );
+        }
+
+        // SAFETY: each perspective wrote its half.
+        unsafe { &output.assume_init_ref().0 }
+    }
+
+    /// Convert input features with a per-perspective additive bias (for
+    /// variants whose state adds a bias to the feature transformer's output,
+    /// such as Three-check's remaining checks): writes `output` and returns it.
+    #[inline(always)]
+    pub fn transform_with_bias<'a, V: crate::variant::Variant>(
+        &self,
+        pos: &Position<V>,
+        accumulator_stack: &mut AccumulatorStack,
+        cache: &mut AccumulatorCaches,
+        biases: [&[i16; HALF_DIMENSIONS]; 2],
+        output: &'a mut MaybeUninit<Aligned<[u8; OUTPUT_DIMENSIONS]>>,
+        nnz_info: &mut NnzInfo,
+    ) -> &'a [u8; OUTPUT_DIMENSIONS] {
+        accumulator_stack.evaluate(pos, self, cache);
+        let accumulator_state = accumulator_stack.latest();
+
+        let perspectives = [pos.side_to_move(), !pos.side_to_move()];
+        let accumulation = &accumulator_state.accumulation;
+
+        for (p, perspective) in perspectives.into_iter().enumerate() {
+            Self::transform_perspective_impl::<true>(
+                &accumulation[perspective.idx()],
+                Some(biases[p]),
+                output,
+                p,
+                nnz_info,
+            );
         }
 
         // SAFETY: each perspective wrote its half.
@@ -242,11 +281,31 @@ impl FeatureTransformer {
         perspective: usize,
         nnz_info: &mut NnzInfo,
     ) {
+        Self::transform_perspective_impl::<false>(
+            accumulation,
+            None,
+            output,
+            perspective,
+            nnz_info,
+        );
+    }
+
+    /// Implementation of `transform_perspective`, with an optional additive
+    /// bias controlled at compile time by `ADD_BIAS` so Chess incurs zero cost.
+    #[inline(always)]
+    fn transform_perspective_impl<const ADD_BIAS: bool>(
+        accumulation: &[i16; HALF_DIMENSIONS],
+        bias: Option<&[i16; HALF_DIMENSIONS]>,
+        output: &mut MaybeUninit<Aligned<[u8; OUTPUT_DIMENSIONS]>>,
+        perspective: usize,
+        nnz_info: &mut NnzInfo,
+    ) {
         let offset = (HALF_DIMENSIONS / 2) * perspective;
 
         #[cfg(vector)]
-        // SAFETY: the loads read vectors of the accumulation, the stores
-        // write vectors of the perspective's half of the output.
+        // SAFETY: the loads read vectors of the accumulation (and bias when
+        // ADD_BIAS is true), the stores write vectors of the perspective's
+        // half of the output.
         unsafe {
             let mut cursor = nnz_info.make_cursor(perspective);
 
@@ -260,9 +319,27 @@ impl FeatureTransformer {
             let (zero, ft_max) = (vec_zero(), vec_set_16(FT_MAX_VAL));
             const { assert!(FT_MAX_VAL == 255) };
 
-            let in0 = |i: usize| vec_load(accumulation.as_ptr().add(i * LANES));
-            let in1 =
-                |i: usize| vec_load(accumulation.as_ptr().add(HALF_DIMENSIONS / 2 + i * LANES));
+            let bias_ptr = if ADD_BIAS {
+                bias.expect("bias provided when ADD_BIAS is true").as_ptr()
+            } else {
+                std::ptr::null()
+            };
+            let in0 = |i: usize| {
+                let v = vec_load(accumulation.as_ptr().add(i * LANES));
+                if ADD_BIAS {
+                    vec_add_16(v, vec_load(bias_ptr.add(i * LANES)))
+                } else {
+                    v
+                }
+            };
+            let in1 = |i: usize| {
+                let v = vec_load(accumulation.as_ptr().add(HALF_DIMENSIONS / 2 + i * LANES));
+                if ADD_BIAS {
+                    vec_add_16(v, vec_load(bias_ptr.add(HALF_DIMENSIONS / 2 + i * LANES)))
+                } else {
+                    v
+                }
+            };
             let out = output.as_mut_ptr().cast::<u8>().add(offset);
 
             // Per the NNUE architecture, here we want to multiply pairs of
@@ -363,8 +440,15 @@ impl FeatureTransformer {
             let _ = nnz_info;
             let output = output.as_mut_ptr().cast::<u8>();
             for j in 0..HALF_DIMENSIONS / 2 {
-                let sum0 = accumulation[j].clamp(0, FT_MAX_VAL);
-                let sum1 = accumulation[j + HALF_DIMENSIONS / 2].clamp(0, FT_MAX_VAL);
+                let mut v0 = accumulation[j];
+                let mut v1 = accumulation[j + HALF_DIMENSIONS / 2];
+                if ADD_BIAS {
+                    let b = bias.expect("bias provided when ADD_BIAS is true");
+                    v0 = v0.wrapping_add(b[j]);
+                    v1 = v1.wrapping_add(b[j + HALF_DIMENSIONS / 2]);
+                }
+                let sum0 = v0.clamp(0, FT_MAX_VAL);
+                let sum1 = v1.clamp(0, FT_MAX_VAL);
 
                 // SAFETY: the perspective's half of the output.
                 unsafe {

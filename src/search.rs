@@ -36,8 +36,8 @@ use crate::misc::{
 };
 use crate::movegen::{ALL, MOVE_LIST_SIZE, MoveList};
 use crate::movepick::MovePicker;
+use crate::nnue::Accumulators;
 use crate::nnue::eval_file::{Networks, UseNnue};
-use crate::nnue::{Accumulators, Caches};
 use crate::position::{Position, Prefetcher, StateInfo};
 use crate::score::Score;
 use crate::syzygy::{ProbeState, SyzygyOptions, Tablebases, Tables, TbConfig};
@@ -46,7 +46,7 @@ use crate::timeman::TimeManagement;
 use crate::tt::TranspositionTable;
 use crate::types::*;
 use crate::uci::{move_to_uci, wdl};
-use crate::variant::{Chess, Variant};
+use crate::variant::Variant;
 
 mod atomic;
 
@@ -619,6 +619,23 @@ impl Default for UpdateContext {
 /// clock, so that its sequence is not deterministic.
 static SKILL_RNG: Mutex<Option<Prng>> = Mutex::new(None);
 
+/// The bounds of Antichess's capture search. A capture is forced there, and
+/// each one opens the next, so a qsearch that played every capture out
+/// before evaluating, as it does evasions in chess, has no bound: one depth 1
+/// search could cost millions of nodes. So only the first plies of a qsearch
+/// play every capture out, and so does any node with a single capture, which
+/// costs no branching. The other nodes stand pat on their evaluation, as
+/// Fairy-Stockfish's qsearch does, and search few captures.
+///
+/// The plies of a qsearch whose nodes play every capture out without
+/// standing pat
+const ANTICHESS_QS_RESOLVED_PLIES: i32 = 2;
+/// The captures searched at a node that stood pat
+const ANTICHESS_QS_CAPTURES: i32 = 2;
+/// The plies of a qsearch after which a node only evaluates, as
+/// Fairy-Stockfish's `DEPTH_QS_MAX`
+const ANTICHESS_QS_MAX_PLIES: i32 = 32;
+
 /// Skill structure is used to implement strength limit. If we have a
 /// UCI_Elo, we convert it to an appropriate skill level, anchored to the
 /// Stash engine. This method is based on a fit of the Elo results for games
@@ -1135,8 +1152,9 @@ pub struct Worker<V: Variant> {
     pub counters: Arc<Counters>,
     sel_depth: i32,
     pub nmp_min_ply: i32,
-
-    optimism: [Value; COLOR_NB],
+    /// The plies of the qsearch under way above its node, which bound
+    /// Antichess's capture search
+    antichess_qs_ply: i32,
 
     pub root_pos: Position<V>,
     pub root_moves: Vec<RootMove>,
@@ -1184,7 +1202,7 @@ impl<V: Variant> Worker<V> {
             counters,
             sel_depth: 0,
             nmp_min_ply: 0,
-            optimism: [0; COLOR_NB],
+            antichess_qs_ply: 0,
             root_pos: Position::new(),
             root_moves: Vec::new(),
             root_depth: 0,
@@ -1196,7 +1214,7 @@ impl<V: Variant> Worker<V> {
             tb_config: TbConfig::default(),
             options: SearchOptions::default(),
             accumulator_stack: V::Accumulators::new(),
-            refresh_table: V::Caches::new(V::eval_file(networks).network()),
+            refresh_table: V::new_caches(networks),
             stack: SearchStack([Stack::default(); 256]),
             pv_table: PvTable([PVMoves::default(); 256]),
             scratch: V::Dirties::default(),
@@ -1259,9 +1277,7 @@ impl<V: Variant> Worker<V> {
         self.hist.continuation_correction_history.fill(5);
 
         // Without a network the caches are cleared when one is loaded.
-        if let Some(network) = V::eval_file(&sh.networks).network() {
-            self.refresh_table.clear(network);
-        }
+        V::clear_caches(&mut self.refresh_table, &sh.networks);
     }
 
     /// Called when the program receives the UCI 'go' command. It searches
@@ -1303,13 +1319,24 @@ impl<V: Variant> Worker<V> {
         (updates.on_start)();
 
         if self.root_moves.is_empty() {
-            // Without moves, a side is lost when mated or, in Atomic, when
-            // its king has exploded, won when the other king has, and is
-            // otherwise stalemated.
+            // Without moves, a side is lost when mated, in Atomic when its
+            // king has exploded (or won when the other king has), in
+            // Three-check when the opponent has already given three checks
+            // (or won when it has), and is otherwise stalemated.
             let v = if V::ATOMIC && !pos.has_king(us) {
                 -VALUE_MATE
             } else if V::ATOMIC && !pos.has_king(!us) {
                 VALUE_MATE
+            } else if V::THREE_CHECK && pos.checks_remaining(!us) == 0 {
+                -VALUE_MATE
+            } else if V::THREE_CHECK && pos.checks_remaining(us) == 0 {
+                VALUE_MATE
+            } else if V::ANTICHESS {
+                if pos.is_antichess_loss() {
+                    -VALUE_MATE
+                } else {
+                    VALUE_MATE
+                }
             } else if pos.in_check() {
                 -VALUE_MATE
             } else {
@@ -1512,7 +1539,6 @@ impl<V: Variant> Worker<V> {
 
         let mut alpha;
         let mut beta;
-        let us = pos.side_to_move();
         let mut time_reduction = 1.0;
         let mut tot_best_move_changes = 0.0;
         let mut delta;
@@ -1638,11 +1664,6 @@ impl<V: Variant> Worker<V> {
                 let previous_score = self.root_moves[pv_idx].previous_score;
                 self.seek_mate = previous_score != -VALUE_INFINITE
                     && previous_score.abs() >= seek_mate_threshold;
-
-                // Adjust optimism based on root move's averageScore. Atomic's
-                // evaluation reads none.
-                self.optimism[us.idx()] = 456 * avg / (avg.abs() + 85);
-                self.optimism[(!us).idx()] = -self.optimism[us.idx()];
 
                 // Start with a small aspiration window and, in the case of a
                 // fail high/low, enlarge the window progressively.
@@ -2122,6 +2143,18 @@ impl<V: Variant> Worker<V> {
 
         let ply = ply_of(ss);
 
+        // In Three-check, if the opponent just gave its third check the game
+        // is already lost, overriding repetitions and the 50-move rule.
+        if V::THREE_CHECK && !root_node && pos.is_three_check_loss() {
+            return mated_in(ply);
+        }
+
+        // In Antichess, losing all pieces wins immediately, overriding
+        // repetitions and the 50-move rule.
+        if V::ANTICHESS && !root_node && pos.is_antichess_win() {
+            return mate_in(ply);
+        }
+
         // Check if we have an upcoming move that draws by repetition
         if !root_node && alpha < VALUE_DRAW && pos.upcoming_repetition(ply) {
             alpha = value_draw(self.nodes());
@@ -2179,10 +2212,28 @@ impl<V: Variant> Worker<V> {
             // the tree then there is no need to search because we will
             // never beat the current alpha. Equal and opposite logic applies
             // when being mated. In either case, return a fail-high score.
+            // In Antichess, stalemate wins immediately at `ply`.
             alpha = mated_in(ply).max(alpha);
-            beta = mate_in(ply + 1).min(beta);
+            beta = if V::ANTICHESS {
+                mate_in(ply)
+            } else {
+                mate_in(ply + 1)
+            }
+            .min(beta);
             if alpha >= beta {
                 return alpha;
+            }
+
+            // When only one check remains, any legal checking move wins in one ply.
+            if V::THREE_CHECK && pos.checks_remaining(us) == 1 {
+                let excluded = self.stack[ss].excluded_move;
+                let check_mv = pos.find_checking_move(excluded);
+                if check_mv != Move::none() {
+                    if pv_node {
+                        self.pv_table.update(ply, check_mv, false);
+                    }
+                    return mate_in(ply + 1);
+                }
             }
         }
 
@@ -2217,7 +2268,11 @@ impl<V: Variant> Worker<V> {
             Move::none()
         };
         tt_data.value = if tt_hit {
-            value_from_tt(tt_data.value, ply, pos.rule50_count())
+            value_from_tt(
+                tt_data.value,
+                ply,
+                if V::CRAZYHOUSE { 0 } else { pos.rule50_count() },
+            )
         } else {
             VALUE_NONE
         };
@@ -2346,7 +2401,7 @@ impl<V: Variant> Worker<V> {
                 // Partial workaround for the graph history interaction
                 // problem. For high rule50 counts don't produce
                 // transposition table cutoffs.
-                if pos.rule50_count() < 96 {
+                if V::CRAZYHOUSE || pos.rule50_count() < 96 {
                     if depth >= 7
                         && tt_data.mv != Move::none()
                         && pos.legal(tt_data.mv)
@@ -2469,23 +2524,27 @@ impl<V: Variant> Worker<V> {
                 if !tt_hit
                     && pos.piece_on(prev_sq).type_of() != PAWN
                     && prev_move.type_of() != PROMOTION
+                    && !(V::ANTICHESS && prev_move.is_king_promotion())
                 {
                     sh.histories.pawn_entry(pos)[pos.piece_on(prev_sq).idx()][prev_sq.idx()]
                         .update(eval_diff * 13);
                 }
             }
 
+            let antichess_forcing = V::ANTICHESS && pos.antichess_has_captures();
+
             // Step 8. Razoring
             // If eval is really low, skip search entirely and return the
             // qsearch value
-            if all_node && eval < alpha - 342 * depth && !self.seek_mate {
+            if !antichess_forcing && all_node && eval < alpha - 342 * depth && !self.seek_mate {
                 return self.qsearch::<NON_PV>(sh, pos, ss, alpha, beta);
             }
 
             // Step 9. Futility pruning: child node
             // The depth condition is important for mate finding. It should
             // NOT be tuned.
-            if !self.stack[ss].tt_pv
+            if !antichess_forcing
+                && !self.stack[ss].tt_pv
                 && depth < if self.seek_mate { 6 } else { 19 }
                 && eval >= beta
                 && (tt_data.mv == Move::none() || tt_capture)
@@ -2506,11 +2565,13 @@ impl<V: Variant> Worker<V> {
             }
 
             // Step 10. Null move search with verification search
-            if cut_node
+            // In Antichess a side that must capture cannot pass.
+            if !antichess_forcing
+                && cut_node
                 && self.stack[ss].static_eval + 50 * self.stack[ss].prior_nmp_fail_high
                     >= beta - 13 * depth - 47 * improving as i32 + 365
                 && excluded_move == Move::none()
-                && pos.non_pawn_material(us) != 0
+                && (pos.non_pawn_material(us) != 0 || (V::CRAZYHOUSE && pos.has_hand(us)))
                 && ply >= self.nmp_min_ply
                 && beta >= -2000
             {
@@ -2518,8 +2579,9 @@ impl<V: Variant> Worker<V> {
 
                 // Null move dynamic reduction based on depth
                 // Odd threads reduce one ply less
-                let mut r = 7 + depth / 3 + ((self.stack[ss].static_eval - beta) / 256).max(0)
-                    - (self.thread_idx & 1) as i32;
+                let mut r =
+                    7 + depth / 3 + ((self.stack[ss].static_eval - beta) / 256).clamp(0, ply / 2)
+                        - (self.thread_idx & 1) as i32;
                 r -= self.seek_mate as i32 * r / 2;
                 self.do_null_move(pos, ss);
 
@@ -2558,7 +2620,14 @@ impl<V: Variant> Worker<V> {
             // Step 11. Internal iterative reductions
             // At sufficient depth, reduce depth for PV/Cut nodes without a
             // TTMove. (*Scaler) Making IIR more aggressive scales poorly.
-            if !self.stack[ss].follow_pv && !all_node && depth >= 6 && tt_data.mv == Move::none() {
+            // In Antichess a node with a forced capture keeps its depth, as
+            // in Fairy-Stockfish.
+            if !antichess_forcing
+                && !self.stack[ss].follow_pv
+                && !all_node
+                && depth >= 6
+                && tt_data.mv == Move::none()
+            {
                 depth -= 1;
             }
 
@@ -2567,7 +2636,8 @@ impl<V: Variant> Worker<V> {
             // reduced search returns a value much above beta, we can
             // (almost) safely prune the previous move.
             let prob_cut_beta = beta + 241 - 64 * improving as i32;
-            if depth >= 3
+            if !V::ANTICHESS
+                && depth >= 3
                 && !is_decisive(beta)
                 && !(is_valid(tt_data.value) && tt_data.value < prob_cut_beta)
             {
@@ -2675,6 +2745,11 @@ impl<V: Variant> Worker<V> {
 
         let mut mp = MovePicker::new(pos, tt_data.mv, depth, cont_hist, ply);
 
+        // In Antichess, a node's only capture is a forced move: it is
+        // extended, as in Fairy-Stockfish, so that forced lines cost no depth.
+        let antichess_only_capture =
+            V::ANTICHESS && pos.antichess_has_captures() && MoveList::new::<ALL>(pos).len() == 1;
+
         let mut value = best_value;
 
         let mut move_count = 0;
@@ -2742,9 +2817,22 @@ impl<V: Variant> Worker<V> {
                 r += 929;
             }
 
+            // In Antichess a move to a square the other side attacks obliges
+            // it to capture there, as a check obliges an answer: such a move
+            // is not pruned, as in Fairy-Stockfish. (No capture is pruned in
+            // Antichess either.)
+            let antichess_obliges_capture = V::ANTICHESS
+                && !capture
+                && (pos.attackers_to(mv.to_sq()) & pos.pieces_c(!us)).any();
+
             // Step 15. Pruning at shallow depths.
             // Depth conditions are important for mate finding.
-            if !root_node && pos.non_pawn_material(us) != 0 && !is_loss(best_value) {
+            // Antichess also prunes for a side with only pawns and kings,
+            // as Fairy-Stockfish does.
+            if !root_node
+                && (V::ANTICHESS || pos.non_pawn_material(us) != 0)
+                && !is_loss(best_value)
+            {
                 // Skip quiet moves if movecount exceeds our threshold
                 if move_count >= (3 + depth * depth) / (2 - improving as i32) {
                     mp.skip_quiet_moves();
@@ -2754,34 +2842,36 @@ impl<V: Variant> Worker<V> {
                 let mut lmr_depth = new_depth - r / 1024;
 
                 if capture || gives_check {
-                    let captured_piece = pos.piece_on(mv.to_sq());
-                    let capt_hist = self.hist.capture_history[moved_piece.idx()][mv.to_sq().idx()]
-                        [captured_piece.type_of().idx()]
-                    .get();
+                    if !V::ANTICHESS {
+                        let captured_piece = pos.piece_on(mv.to_sq());
+                        let capt_hist = self.hist.capture_history[moved_piece.idx()]
+                            [mv.to_sq().idx()][captured_piece.type_of().idx()]
+                        .get();
 
-                    // Futility pruning for captures
-                    if !gives_check && lmr_depth < 8 {
-                        let futility_value = self.stack[ss].static_eval
-                            + 234
-                            + 247 * lmr_depth
-                            + captured_piece.value()
-                            + 134 * capt_hist / 1024;
+                        // Futility pruning for captures
+                        if !gives_check && lmr_depth < 8 {
+                            let futility_value = self.stack[ss].static_eval
+                                + 234
+                                + 247 * lmr_depth
+                                + captured_piece.value()
+                                + 134 * capt_hist / 1024;
 
-                        if futility_value <= alpha {
+                            if futility_value <= alpha {
+                                continue;
+                            }
+                        }
+
+                        // SEE based pruning for captures and checks.
+                        // Avoid pruning sacrifices of our last piece for
+                        // stalemate.
+                        let margin = 177 * depth + capt_hist * 34 / 1024;
+                        if (alpha >= VALUE_DRAW || pos.non_pawn_material(us) != moved_piece.value())
+                            && !pos.see_ge(mv, -margin)
+                        {
                             continue;
                         }
                     }
-
-                    // SEE based pruning for captures and checks.
-                    // Avoid pruning sacrifices of our last piece for
-                    // stalemate.
-                    let margin = 177 * depth + capt_hist * 34 / 1024;
-                    if (alpha >= VALUE_DRAW || pos.non_pawn_material(us) != moved_piece.value())
-                        && !pos.see_ge(mv, -margin)
-                    {
-                        continue;
-                    }
-                } else if !self.stack[ss].follow_pv || !pv_node {
+                } else if !antichess_obliges_capture && (!self.stack[ss].follow_pv || !pv_node) {
                     let mut history = cont_hist[0][moved_piece.idx()][mv.to_sq().idx()].get()
                         + cont_hist[1][moved_piece.idx()][mv.to_sq().idx()].get()
                         + sh.histories.pawn_entry(pos)[moved_piece.idx()][mv.to_sq().idx()].get();
@@ -2814,7 +2904,7 @@ impl<V: Variant> Worker<V> {
                     lmr_depth = lmr_depth.max(0);
 
                     // Prune moves with negative SEE
-                    if !pos.see_ge(mv, -23 * lmr_depth * lmr_depth) {
+                    if !V::ANTICHESS && !pos.see_ge(mv, -23 * lmr_depth * lmr_depth) {
                         continue;
                     }
                 }
@@ -2917,6 +3007,10 @@ impl<V: Variant> Worker<V> {
             self.do_move(sh, pos, mv, gives_check, capture, ss);
 
             // Add extension to new depth
+            if antichess_only_capture && extension < 1 {
+                extension = 1;
+            }
+
             new_depth += extension;
 
             // Step 18. Compute and apply late moves reductions/extensions
@@ -3237,6 +3331,8 @@ impl<V: Variant> Worker<V> {
         if move_count == 0 {
             best_value = if excluded_move != Move::none() {
                 alpha
+            } else if V::ANTICHESS {
+                mate_in(ply)
             } else if self.stack[ss].in_check {
                 mated_in(ply)
             } else {
@@ -3292,7 +3388,10 @@ impl<V: Variant> Worker<V> {
             self.hist.main_history[(!us).idx()][prev_move.raw() as usize]
                 .update(scaled_bonus * 215 / 32768);
 
-            if pos.piece_on(prev_sq).type_of() != PAWN && prev_move.type_of() != PROMOTION {
+            if pos.piece_on(prev_sq).type_of() != PAWN
+                && prev_move.type_of() != PROMOTION
+                && !(V::ANTICHESS && prev_move.is_king_promotion())
+            {
                 sh.histories.pawn_entry(pos)[pos.piece_on(prev_sq).idx()][prev_sq.idx()]
                     .update(scaled_bonus * 324 / 8192);
             }
@@ -3387,6 +3486,24 @@ impl<V: Variant> Worker<V> {
 
         let ply = ply_of(ss);
 
+        // In Three-check, if the opponent just gave its third check the game
+        // is already lost, overriding repetitions and the 50-move rule.
+        if V::THREE_CHECK && pos.is_three_check_loss() {
+            if pv_node {
+                self.pv_table[ply - 1].clear();
+            }
+            return mated_in(ply);
+        }
+
+        // In Antichess, losing all pieces wins immediately, overriding
+        // repetitions and the 50-move rule.
+        if V::ANTICHESS && pos.is_antichess_win() {
+            if pv_node {
+                self.pv_table[ply - 1].clear();
+            }
+            return mate_in(ply);
+        }
+
         // Check if we have an upcoming move that draws by repetition
         if alpha < VALUE_DRAW && pos.upcoming_repetition(ply) {
             alpha = value_draw(self.nodes());
@@ -3422,6 +3539,34 @@ impl<V: Variant> Worker<V> {
             };
         }
 
+        // When only one check remains, any legal checking move wins in one ply
+        // (even a quiet check that qsearch would otherwise skip).
+        if V::THREE_CHECK && pos.checks_remaining(pos.side_to_move()) == 1 {
+            let check_mv = pos.find_checking_move(Move::none());
+            if check_mv != Move::none() {
+                if pv_node && mate_in(ply + 1) > alpha {
+                    self.pv_table.update(ply, check_mv, false);
+                }
+                return mate_in(ply + 1);
+            }
+        }
+
+        let antichess_captures = V::ANTICHESS && pos.antichess_has_captures();
+        if V::ANTICHESS && !antichess_captures && !pos.antichess_has_quiet_move() {
+            if pv_node {
+                self.pv_table[ply - 1].clear();
+            }
+            return mate_in(ply);
+        }
+
+        // Whether this node searches its forced captures at all, and whether
+        // it plays them all out without standing pat, as its first plies and
+        // a single capture do (see `ANTICHESS_QS_RESOLVED_PLIES`).
+        let antichess_search = antichess_captures && self.antichess_qs_ply < ANTICHESS_QS_MAX_PLIES;
+        let antichess_resolve = antichess_search
+            && (self.antichess_qs_ply < ANTICHESS_QS_RESOLVED_PLIES
+                || MoveList::new::<ALL>(pos).len() == 1);
+
         debug_assert!((0..MAX_PLY).contains(&ply));
 
         // Step 3. Transposition table lookup
@@ -3431,7 +3576,11 @@ impl<V: Variant> Worker<V> {
         self.stack[ss].tt_hit = tt_hit;
         tt_data.mv = if tt_hit { tt_data.mv } else { Move::none() };
         tt_data.value = if tt_hit {
-            value_from_tt(tt_data.value, ply, pos.rule50_count())
+            value_from_tt(
+                tt_data.value,
+                ply,
+                if V::CRAZYHOUSE { 0 } else { pos.rule50_count() },
+            )
         } else {
             VALUE_NONE
         };
@@ -3456,7 +3605,7 @@ impl<V: Variant> Worker<V> {
         let mut unadjusted_static_eval = VALUE_NONE;
         let mut best_value;
         let futility_base;
-        if self.stack[ss].in_check {
+        if self.stack[ss].in_check || antichess_resolve {
             best_value = -VALUE_INFINITE;
             futility_base = -VALUE_INFINITE;
         } else {
@@ -3519,103 +3668,120 @@ impl<V: Variant> Worker<V> {
             futility_base = self.stack[ss].static_eval + 306;
         }
 
-        let cont_hist = sh
-            .histories
-            .continuation(self.stack[ss - 1].continuation_history);
+        if !V::ANTICHESS || antichess_search {
+            let cont_hist = sh
+                .histories
+                .continuation(self.stack[ss - 1].continuation_history);
 
-        let prev_move = self.stack[ss - 1].current_move;
-        let prev_sq = if prev_move.is_ok() {
-            prev_move.to_sq()
-        } else {
-            Square::NONE
-        };
+            let prev_move = self.stack[ss - 1].current_move;
+            let prev_sq = if prev_move.is_ok() {
+                prev_move.to_sq()
+            } else {
+                Square::NONE
+            };
 
-        // Initialize a MovePicker object for the current position, and
-        // prepare to search the moves. We presently use two stages of move
-        // generator in quiescence search: captures, or evasions only when in
-        // check.
-        let mut mp = MovePicker::new(pos, tt_data.mv, DEPTH_QS, [cont_hist; 6], ply);
+            // Initialize a MovePicker object for the current position, and
+            // prepare to search the moves. We presently use two stages of move
+            // generator in quiescence search: captures, or evasions only when in
+            // check.
+            let mut mp = MovePicker::new(pos, tt_data.mv, DEPTH_QS, [cont_hist; 6], ply);
 
-        // Step 5. Loop through all legal moves until no moves remain or a
-        // beta cutoff occurs.
-        loop {
-            let mv = mp.next_move(pos, &self.hist, &sh.histories);
-            if mv == Move::none() {
-                break;
-            }
+            // Step 5. Loop through all legal moves until no moves remain or a
+            // beta cutoff occurs.
+            loop {
+                let mv = mp.next_move(pos, &self.hist, &sh.histories);
+                if mv == Move::none() {
+                    break;
+                }
 
-            debug_assert!(mv.is_ok());
+                debug_assert!(mv.is_ok());
 
-            let gives_check = pos.gives_check(mv);
-            let capture = pos.capture_stage(mv);
+                let gives_check = pos.gives_check(mv);
+                let capture = pos.capture_stage(mv);
 
-            move_count += 1;
+                move_count += 1;
 
-            // Step 6. Pruning
-            if !is_loss(best_value) {
-                // Futility pruning and moveCount pruning
-                if !gives_check
-                    && mv.to_sq() != prev_sq
-                    && !is_loss(futility_base)
-                    && mv.type_of() != PROMOTION
+                // In Antichess, a node that stood pat searches few captures.
+                if V::ANTICHESS
+                    && !antichess_resolve
+                    && !is_loss(best_value)
+                    && move_count > ANTICHESS_QS_CAPTURES
                 {
-                    if move_count > 2 {
-                        continue;
-                    }
-
-                    let futility_value = futility_base + pos.piece_on(mv.to_sq()).value();
-
-                    // If static eval + value of piece we are going to capture
-                    // is much lower than alpha, we can prune this move.
-                    if futility_value <= alpha {
-                        best_value = best_value.max(futility_value);
-                        continue;
-                    }
-
-                    // If static exchange evaluation is low enough, we can
-                    // prune
-                    if !pos.see_ge(mv, alpha - futility_base) {
-                        best_value = best_value.max(alpha.min(futility_base));
-                        continue;
-                    }
-                }
-
-                // Skip non-captures
-                if !capture {
                     continue;
                 }
 
-                // Do not search moves with bad enough SEE values
-                if !pos.see_ge(mv, -74) {
-                    continue;
-                }
-            }
+                // Step 6. Pruning
+                if !V::ANTICHESS && !is_loss(best_value) {
+                    // Futility pruning and moveCount pruning
+                    if !gives_check
+                        && mv.to_sq() != prev_sq
+                        && !is_loss(futility_base)
+                        && mv.type_of() != PROMOTION
+                    {
+                        if move_count > 2 {
+                            continue;
+                        }
 
-            // Step 7. Make and search the move
-            self.do_move(sh, pos, mv, gives_check, capture, ss);
+                        let futility_value = futility_base + pos.piece_on(mv.to_sq()).value();
 
-            let value = -self.qsearch::<NT>(sh, pos, ss + 1, -beta, -alpha);
-            self.undo_move(pos, mv);
+                        // If static eval + value of piece we are going to capture
+                        // is much lower than alpha, we can prune this move.
+                        if futility_value <= alpha {
+                            best_value = best_value.max(futility_value);
+                            continue;
+                        }
 
-            debug_assert!(value > -VALUE_INFINITE && value < VALUE_INFINITE);
-
-            // Step 8. Check for a new best move
-            if value > best_value {
-                best_value = value;
-
-                if value > alpha {
-                    best_move = mv;
-
-                    // Update pv even in fail-high case
-                    if pv_node {
-                        self.pv_table.update(ply, mv, true);
+                        // If static exchange evaluation is low enough, we can
+                        // prune
+                        if !pos.see_ge(mv, alpha - futility_base) {
+                            best_value = best_value.max(alpha.min(futility_base));
+                            continue;
+                        }
                     }
 
-                    if value < beta {
-                        // Update alpha here!
-                        alpha = value;
-                    } else {
-                        break; // Fail high
+                    // Skip non-captures
+                    if !capture {
+                        continue;
+                    }
+
+                    // Do not search moves with bad enough SEE values
+                    if !pos.see_ge(mv, -74) {
+                        continue;
+                    }
+                }
+
+                // Step 7. Make and search the move
+                self.do_move(sh, pos, mv, gives_check, capture, ss);
+
+                if V::ANTICHESS {
+                    self.antichess_qs_ply += 1;
+                }
+                let value = -self.qsearch::<NT>(sh, pos, ss + 1, -beta, -alpha);
+                if V::ANTICHESS {
+                    self.antichess_qs_ply -= 1;
+                }
+                self.undo_move(pos, mv);
+
+                debug_assert!(value > -VALUE_INFINITE && value < VALUE_INFINITE);
+
+                // Step 8. Check for a new best move
+                if value > best_value {
+                    best_value = value;
+
+                    if value > alpha {
+                        best_move = mv;
+
+                        // Update pv even in fail-high case
+                        if pv_node {
+                            self.pv_table.update(ply, mv, true);
+                        }
+
+                        if value < beta {
+                            // Update alpha here!
+                            alpha = value;
+                        } else {
+                            break; // Fail high
+                        }
                     }
                 }
             }
@@ -3624,7 +3790,7 @@ impl<V: Variant> Worker<V> {
         // Step 9. Check for mate and stalemate
         // All legal moves have been searched. A special case: if we are in
         // check and no legal moves were found, it is checkmate.
-        if move_count == 0 {
+        if !V::ANTICHESS && move_count == 0 {
             if self.stack[ss].in_check {
                 // Checkmate!
                 debug_assert!(MoveList::new::<ALL>(pos).is_empty());
@@ -3681,11 +3847,10 @@ impl<V: Variant> Worker<V> {
     #[inline(always)]
     fn evaluate(&mut self, sh: &SharedState, pos: &Position<V>) -> Value {
         V::evaluate(
-            V::eval_file(&sh.networks).network(),
+            &sh.networks,
             pos,
             &mut self.accumulator_stack,
             &mut self.refresh_table,
-            self.optimism[pos.side_to_move().idx()],
             self.options.use_nnue,
         )
     }
@@ -3777,6 +3942,9 @@ impl<V: Variant> Worker<V> {
             return false;
         }
         if pos.state().plies_from_null < 6 || ply_of(ss) < 20 {
+            return false;
+        }
+        if V::CRAZYHOUSE && (mv.is_drop() || self.stack[ss - 2].current_move.is_drop()) {
             return false;
         }
         mv.from_sq() == self.stack[ss - 2].current_move.to_sq()
@@ -3922,12 +4090,12 @@ impl<V: Variant> Worker<V> {
     }
 }
 
-impl Worker<Chess> {
+impl<V: Variant> Worker<V> {
     /// Searches the root to `depth` in the window (alpha, beta).
     pub(crate) fn chess_search_root(
         &mut self,
         sh: &SharedState,
-        pos: &mut Position<Chess>,
+        pos: &mut Position<V>,
         alpha: Value,
         beta: Value,
         depth: Depth,

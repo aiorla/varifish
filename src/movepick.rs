@@ -314,10 +314,10 @@ impl<'a> MovePicker<'a> {
     /// ordered using the history tables. Returns the end of the moves
     /// written.
     #[inline(always)]
-    fn score<const T: GenType>(
+    fn score<const T: GenType, V: Variant>(
         &mut self,
         ml: &MoveList,
-        pos: &Position<impl Variant>,
+        pos: &Position<V>,
         h: &WorkerHistories,
         shared: &SharedHistories,
     ) -> usize {
@@ -326,7 +326,7 @@ impl<'a> MovePicker<'a> {
         let us = pos.side_to_move();
 
         let mut threat_by_lesser = [Bitboard::EMPTY; PIECE_TYPE_NB];
-        if T == QUIETS {
+        if T == QUIETS && !V::ANTICHESS {
             threat_by_lesser[PAWN.idx()] = Bitboard::EMPTY;
             threat_by_lesser[KNIGHT.idx()] = pos.threats_by(PAWN);
             threat_by_lesser[BISHOP.idx()] = threat_by_lesser[KNIGHT.idx()];
@@ -354,8 +354,12 @@ impl<'a> MovePicker<'a> {
             let captured_piece = pos.piece_on(to);
 
             let value = if T == CAPTURES {
-                h.capture_history[pc.idx()][to.idx()][captured_piece.type_of().idx()].get()
-                    + 7 * captured_piece.value()
+                if V::ANTICHESS {
+                    h.capture_history[pc.idx()][to.idx()][captured_piece.type_of().idx()].get()
+                } else {
+                    h.capture_history[pc.idx()][to.idx()][captured_piece.type_of().idx()].get()
+                        + 7 * captured_piece.value()
+                }
             } else if T == QUIETS {
                 // histories
                 let mut value = 2 * main_history[m.raw() as usize].get();
@@ -366,18 +370,21 @@ impl<'a> MovePicker<'a> {
                 value += ch[3][pc.idx()][to.idx()].get();
                 value += ch[5][pc.idx()][to.idx()].get();
 
-                // penalty for moving to a square threatened by a lesser
-                // piece or bonus for escaping an attack by a lesser piece.
-                let threats = threat_by_lesser[pt.idx() & 7];
-                let v = 20 * (threats.has(from) as i32 - threats.has(to) as i32);
-                value += PIECE_VALUE[pt.idx()] * v;
+                if !V::ANTICHESS {
+                    // penalty for moving to a square threatened by a lesser
+                    // piece or bonus for escaping an attack by a lesser piece.
+                    let threats = threat_by_lesser[pt.idx() & 7];
+                    let escape = (!V::CRAZYHOUSE || !m.is_drop()) && threats.has(from);
+                    let v = 20 * (escape as i32 - threats.has(to) as i32);
+                    value += PIECE_VALUE[pt.idx()] * v;
+                }
 
                 if let Some(lph) = low_ply_history {
                     value += 8 * lph[m.raw() as usize].get() / (1 + self.ply);
                 }
 
                 // bonus for checks
-                if pos.check_squares(pt).has(to) && pos.see_ge(m, -75) {
+                if !V::ANTICHESS && pos.check_squares(pt).has(to) && pos.see_ge(m, -75) {
                     value += 16384;
                 }
 
@@ -412,7 +419,7 @@ impl<'a> MovePicker<'a> {
 
         self.cur = 0;
         self.end_bad_moves = 0;
-        self.end_cur = self.score::<CAPTURES>(&ml, pos, h, shared);
+        self.end_cur = self.score::<CAPTURES, _>(&ml, pos, h, shared);
 
         let (cur, end_cur) = (self.cur, self.end_cur);
         partial_insertion_sort(self.slice_mut(cur, end_cur), i32::MIN);
@@ -430,7 +437,7 @@ impl<'a> MovePicker<'a> {
 
         // The quiets follow the bad captures
         self.cur = self.end_bad_moves;
-        self.end_cur = self.score::<QUIETS>(&ml, pos, h, shared);
+        self.end_cur = self.score::<QUIETS, _>(&ml, pos, h, shared);
 
         let (cur, end_cur, limit) = (self.cur, self.end_cur, -3560 * self.depth);
         partial_insertion_sort(self.slice_mut(cur, end_cur), limit);
@@ -448,7 +455,7 @@ impl<'a> MovePicker<'a> {
 
         self.cur = 0;
         self.end_bad_moves = 0;
-        self.end_cur = self.score::<EVASIONS>(&ml, pos, h, shared);
+        self.end_cur = self.score::<EVASIONS, _>(&ml, pos, h, shared);
 
         let (cur, end_cur) = (self.cur, self.end_cur);
         partial_insertion_sort(self.slice_mut(cur, end_cur), i32::MIN);
@@ -472,9 +479,9 @@ impl<'a> MovePicker<'a> {
     /// one new legal move on every call until there are no more moves left,
     /// picking the move with the highest score from a list of generated
     /// moves.
-    pub fn next_move(
+    pub fn next_move<V: Variant>(
         &mut self,
-        pos: &Position<impl Variant>,
+        pos: &Position<V>,
         h: &WorkerHistories,
         shared: &SharedHistories,
     ) -> Move {
@@ -522,7 +529,7 @@ impl<'a> MovePicker<'a> {
                             let m = self.get(self.cur);
                             self.cur += 1;
                             if m.mv != self.tt_move {
-                                if pos.see_ge(m.mv, -m.value / 18) {
+                                if V::ANTICHESS || pos.see_ge(m.mv, -m.value / 18) {
                                     return m.mv;
                                 }
                                 self.set(self.end_bad_moves, m);
@@ -532,7 +539,7 @@ impl<'a> MovePicker<'a> {
 
                         self.end_bad_captures = self.end_bad_moves;
 
-                        if self.skip_quiets {
+                        if self.skip_quiets || (V::ANTICHESS && self.end_cur > 0) {
                             break 'prepare_bad_moves;
                         }
 

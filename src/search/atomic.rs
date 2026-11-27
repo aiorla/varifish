@@ -557,11 +557,12 @@ impl Worker<Atomic> {
             {
                 debug_assert!(self.stack[ss - 1].current_move != Move::null());
 
-                // Atomic-Stockfish's reduction, and a ply more for each 256
-                // of static evaluation over beta. Odd threads reduce one ply
+                // Atomic-Stockfish's reduction, and a ply more for each 258
+                // of static evaluation over beta, at most half the ply, as
+                // Stockfish's 3e8fde75 bounds it. Odd threads reduce one ply
                 // less, as Stockfish's do.
                 let mut r = null_move_reduction(depth)
-                    + ((self.stack[ss].static_eval - beta) / 258).max(0)
+                    + ((self.stack[ss].static_eval - beta) / 258).clamp(0, ply / 2)
                     - (self.thread_idx & 1) as i32;
                 r -= self.seek_mate as i32 * r / 2;
                 self.do_null_move(pos, ss);

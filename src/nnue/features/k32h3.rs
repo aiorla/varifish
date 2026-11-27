@@ -185,14 +185,16 @@ pub fn write_indices(
 
 /// Get a list of indices for recently changed features
 #[inline(always)]
-pub fn append_changed_indices(
+pub fn append_changed_indices<V: Variant>(
     perspective: Color,
     ksq: Square,
     diff: &DirtyPiece,
     removed: &mut IndexList,
     added: &mut IndexList,
 ) {
-    removed.push(make_index(perspective, diff.from, diff.pc, ksq));
+    if !V::CRAZYHOUSE || diff.from != Square::NONE {
+        removed.push(make_index(perspective, diff.from, diff.pc, ksq));
+    }
     if diff.to != Square::NONE {
         added.push(make_index(perspective, diff.to, diff.pc, ksq));
     }

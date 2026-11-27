@@ -49,13 +49,13 @@ pub(super) const LAYER_STACK_TABLE_HASH: u32 = 0x5A7A_B1E5;
 /// each raw one falls back to, which must fall back to itself, into
 /// `fallback`, and into `index` where in the stored stacks each raw stack's
 /// is. Returns how many are stored, at most `max_stored`.
-pub(super) fn read_layer_stack_table(
+pub(super) fn read_layer_stack_table_n<const RAW: usize>(
     reader: &mut Reader,
-    fallback: &mut [u16; RAW_LAYER_STACKS],
-    index: &mut [u16; RAW_LAYER_STACKS],
+    fallback: &mut [u16; RAW],
+    index: &mut [u16; RAW],
     max_stored: usize,
 ) -> Option<usize> {
-    if reader.read_u32() != LAYER_STACK_TABLE_HASH || reader.read_u32() != RAW_LAYER_STACKS as u32 {
+    if reader.read_u32() != LAYER_STACK_TABLE_HASH || reader.read_u32() != RAW as u32 {
         return None;
     }
     let stored = reader.read_u32() as usize;
@@ -64,12 +64,12 @@ pub(super) fn read_layer_stack_table(
     }
     for f in fallback.iter_mut() {
         *f = reader.read_u16();
-        if usize::from(*f) >= RAW_LAYER_STACKS {
+        if usize::from(*f) >= RAW {
             return None;
         }
     }
     let mut count = 0;
-    for s in 0..RAW_LAYER_STACKS {
+    for s in 0..RAW {
         if usize::from(fallback[s]) == s {
             index[s] = count;
             count += 1;
@@ -78,7 +78,7 @@ pub(super) fn read_layer_stack_table(
     if usize::from(count) != stored {
         return None;
     }
-    for s in 0..RAW_LAYER_STACKS {
+    for s in 0..RAW {
         let f = usize::from(fallback[s]);
         if usize::from(fallback[f]) != f {
             return None;
@@ -88,19 +88,36 @@ pub(super) fn read_layer_stack_table(
     reader.good().then_some(stored)
 }
 
+pub(super) fn read_layer_stack_table(
+    reader: &mut Reader,
+    fallback: &mut [u16; RAW_LAYER_STACKS],
+    index: &mut [u16; RAW_LAYER_STACKS],
+    max_stored: usize,
+) -> Option<usize> {
+    read_layer_stack_table_n(reader, fallback, index, max_stored)
+}
+
 /// Writes a table of layer stacks, of `stored` stacks and each raw one's
 /// `fallback`.
+pub(super) fn write_layer_stack_table_n<const RAW: usize>(
+    out: &mut Vec<u8>,
+    stored: usize,
+    fallback: &[u16; RAW],
+) {
+    write_u32(out, LAYER_STACK_TABLE_HASH);
+    write_u32(out, RAW as u32);
+    write_u32(out, stored as u32);
+    for &f in fallback {
+        write_u16(out, f);
+    }
+}
+
 pub(super) fn write_layer_stack_table(
     out: &mut Vec<u8>,
     stored: usize,
     fallback: &[u16; RAW_LAYER_STACKS],
 ) {
-    write_u32(out, LAYER_STACK_TABLE_HASH);
-    write_u32(out, RAW_LAYER_STACKS as u32);
-    write_u32(out, stored as u32);
-    for &f in fallback {
-        write_u16(out, f);
-    }
+    write_layer_stack_table_n(out, stored, fallback);
 }
 
 impl Network {
@@ -203,9 +220,9 @@ impl Network {
 
     /// The evaluation of the position, from the side to move's point of
     /// view, whose state the stack's latest state holds.
-    pub fn evaluate(
+    pub fn evaluate<V: crate::variant::Variant>(
         &self,
-        pos: &Position,
+        pos: &Position<V>,
         accumulator_stack: &mut AccumulatorStack,
         cache: &mut AccumulatorCaches,
     ) -> Value {
@@ -225,9 +242,9 @@ impl Network {
     }
 
     /// The evaluation by each layer stack.
-    pub fn trace_evaluate(
+    pub fn trace_evaluate<V: crate::variant::Variant>(
         &self,
-        pos: &Position,
+        pos: &Position<V>,
         accumulator_stack: &mut AccumulatorStack,
         cache: &mut AccumulatorCaches,
     ) -> NnueEvalTrace {
@@ -262,7 +279,7 @@ impl Network {
     /// of the board, one or none, and by whether a side has two officers,
     /// pieces other than pawns and kings.
     #[inline(always)]
-    fn layer_stack(&self, pos: &Position) -> usize {
+    fn layer_stack<V: crate::variant::Variant>(&self, pos: &Position<V>) -> usize {
         let stm = pos.side_to_move();
         let band = (pos.count_both(ALL_PIECES) - 1) / 4;
         let queens = 2 * i32::from(pos.pieces_cpt(stm, QUEEN).any())

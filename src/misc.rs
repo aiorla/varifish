@@ -1,4 +1,4 @@
-//! The pseudo-random number generator behind the Zobrist keys and magics, a
+//! The pseudo-random number generator behind the Zobrist keys, a
 //! fixed-capacity list, prefetching, the clock, and parsing as C++ input
 //! streams do.
 //!
@@ -30,12 +30,6 @@ impl Prng {
         self.s ^= self.s << 25;
         self.s ^= self.s >> 27;
         self.s.wrapping_mul(2685821657736338717)
-    }
-
-    /// A number with only 1/8th of its bits set on average, to find magics
-    /// quickly.
-    pub const fn sparse_rand(&mut self) -> u64 {
-        self.rand64() & self.rand64() & self.rand64()
     }
 }
 

@@ -22,9 +22,19 @@ use crate::movegen::{ALL, GenType, MoveList, Moves};
 use crate::types::*;
 use crate::variant::{Chess, Variant};
 
+mod antichess;
 mod atomic;
+mod crazyhouse;
+mod threecheck;
 
 pub use atomic::AtomicState;
+pub use crazyhouse::{
+    CrazyhouseState, FEN_HAND_ORDER, HAND_PIECE_TYPES, HAND_TYPES, ZOBRIST_HAND, ZOBRIST_PROMOTED,
+};
+pub(crate) use crazyhouse::{
+    crazyhouse_extra_key, on_board_move, on_capture, on_promotion, write_hand_fen,
+};
+pub use threecheck::{CHECK_STATES, ChecksRemaining, MAX_CHECKS, ZOBRIST_CHECKS};
 
 pub const START_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
@@ -567,6 +577,7 @@ impl<V: Variant> Position<V> {
         let mut num_pieces = 0;
         let mut file = FILE_A as i32;
         let mut rank = RANK_8 as i32;
+        let mut last_sq = Square::NONE;
 
         // 1. Piece placement
         loop {
@@ -576,7 +587,41 @@ impl<V: Variant> Position<V> {
             if is_space(token) {
                 break;
             }
+            if V::CRAZYHOUSE && token == b'~' {
+                if last_sq == Square::NONE {
+                    return error("Invalid FEN. Unexpected '~' marker.");
+                }
+                let pt = self.piece_on(last_sq).type_of();
+                if pt == PAWN || pt == KING {
+                    return error("Invalid FEN. Pawns and kings cannot be promoted.");
+                }
+                V::set_promoted(&mut st.extra, last_sq);
+                last_sq = Square::NONE;
+                continue;
+            }
+            if V::CRAZYHOUSE && token == b'[' {
+                if rank != RANK_1 as i32 || file != FILE_NB as i32 {
+                    return error("Invalid FEN. Pocket must follow the board placement.");
+                }
+                loop {
+                    let Some(ch) = ss.get() else {
+                        return error("Invalid FEN. Unterminated pocket.");
+                    };
+                    if ch == b']' {
+                        break;
+                    }
+                    let Some((c, pt)) = crazyhouse::parse_hand_char(ch) else {
+                        return error(format!("Invalid FEN. Invalid pocket piece: {}", ch as char));
+                    };
+                    V::add_hand(&mut st.extra, c, pt);
+                }
+                if !ss.get().is_some_and(is_space) {
+                    return error("Invalid FEN. Expected whitespace after pocket.");
+                }
+                break;
+            }
             if token.is_ascii_digit() {
+                last_sq = Square::NONE;
                 let diff = (token - b'0') as i32;
                 if !(1..=8).contains(&diff) {
                     return error("Invalid FEN. Invalid number of squares to skip.");
@@ -586,8 +631,38 @@ impl<V: Variant> Position<V> {
                     return error("Invalid FEN. Invalid file reached.");
                 }
             } else if token == b'/' {
+                last_sq = Square::NONE;
                 if file != FILE_NB as i32 {
                     return error("Invalid FEN. Trying to end rank when not at the end of it.");
+                }
+                if V::CRAZYHOUSE && rank == RANK_1 as i32 {
+                    // Lichess 9th-slash pocket format, e.g. `.../RNBQKBNR/QNp w ...` or `/-`.
+                    let mut saw_dash = false;
+                    let mut saw_piece = false;
+                    loop {
+                        let Some(ch) = ss.get() else {
+                            return error("Invalid FEN. Unexpected end of stream.");
+                        };
+                        if is_space(ch) {
+                            break;
+                        }
+                        if ch == b'-' && !saw_dash && !saw_piece {
+                            saw_dash = true;
+                            continue;
+                        }
+                        if saw_dash {
+                            return error("Invalid FEN. Invalid pocket after '-'.");
+                        }
+                        let Some((c, pt)) = crazyhouse::parse_hand_char(ch) else {
+                            return error(format!(
+                                "Invalid FEN. Invalid pocket piece: {}",
+                                ch as char
+                            ));
+                        };
+                        saw_piece = true;
+                        V::add_hand(&mut st.extra, c, pt);
+                    }
+                    break;
                 }
                 rank -= 1;
                 file = FILE_A as i32;
@@ -605,7 +680,9 @@ impl<V: Variant> Position<V> {
                 if num_pieces > 32 {
                     return error("Invalid FEN. More than 32 pieces on the board.");
                 }
-                self.put_piece(Piece(idx as u8), Square::new(file as u8, rank as u8), None);
+                let sq = Square::new(file as u8, rank as u8);
+                self.put_piece(Piece(idx as u8), sq, None);
+                last_sq = sq;
                 file += 1;
             }
         }
@@ -619,8 +696,11 @@ impl<V: Variant> Position<V> {
         }
 
         // In Atomic, the side to move has no king once it exploded; the side
-        // to move is checked below.
-        if if V::ATOMIC {
+        // to move is checked below. In Antichess, kings are ordinary pieces
+        // that may be captured or promoted to.
+        if if V::ANTICHESS {
+            false
+        } else if V::ATOMIC {
             self.count(WHITE, KING) > 1 || self.count(BLACK, KING) > 1 || self.count_both(KING) == 0
         } else {
             self.count(WHITE, KING) != 1 || self.count(BLACK, KING) != 1
@@ -628,20 +708,45 @@ impl<V: Variant> Position<V> {
             return error("Unsupported position. Incorrect number of kings.");
         }
 
-        for c in [WHITE, BLACK] {
-            let name = if c == WHITE { "WHITE" } else { "BLACK" };
-            if self.count(c, PAWN) > 8 {
-                return error(format!(
-                    "Unsupported position. {name} has more than 8 pawns."
-                ));
-            }
+        if !V::CRAZYHOUSE {
+            for c in [WHITE, BLACK] {
+                let name = if c == WHITE { "WHITE" } else { "BLACK" };
+                if self.count(c, PAWN) > 8 {
+                    return error(format!(
+                        "Unsupported position. {name} has more than 8 pawns."
+                    ));
+                }
 
-            let additional = (self.count(c, KNIGHT) - 2).max(0)
-                + (self.count(c, BISHOP) - 2).max(0)
-                + (self.count(c, ROOK) - 2).max(0)
-                + (self.count(c, QUEEN) - 1).max(0);
-            if additional > 8 - self.count(c, PAWN) {
-                return error(format!("Unsupported position. Too many pieces for {name}."));
+                let additional = (self.count(c, KNIGHT) - 2).max(0)
+                    + (self.count(c, BISHOP) - 2).max(0)
+                    + (self.count(c, ROOK) - 2).max(0)
+                    + (self.count(c, QUEEN) - 1).max(0)
+                    + if V::ANTICHESS {
+                        (self.count(c, KING) - 1).max(0)
+                    } else {
+                        0
+                    };
+                if additional > 8 - self.count(c, PAWN) {
+                    return error(format!("Unsupported position. Too many pieces for {name}."));
+                }
+            }
+        } else {
+            let hand_total: i32 = [WHITE, BLACK]
+                .into_iter()
+                .flat_map(|c| {
+                    [PAWN, KNIGHT, BISHOP, ROOK, QUEEN]
+                        .into_iter()
+                        .map(move |pt| V::hand_count(&st.extra, c, pt) as i32)
+                })
+                .sum();
+            if self.pieces().popcount() + hand_total > 32 {
+                return error("Unsupported position. Too many pieces in Crazyhouse.");
+            }
+            // As many pawns as a game can have: those on the board and in
+            // hand, and the promoted pieces, which a capture turns back into
+            // pawns. Pawn move generation relies on at most 16.
+            if self.crazyhouse_pawns(&st.extra) > 16 {
+                return error("Unsupported position. More than 16 pawns in Crazyhouse.");
             }
         }
 
@@ -694,6 +799,16 @@ impl<V: Variant> Position<V> {
             let king = make_piece(c, KING);
 
             token = token.to_ascii_uppercase();
+
+            if V::ANTICHESS {
+                if token == b'K' || token == b'Q' || (b'A'..=b'H').contains(&token) {
+                    continue;
+                }
+                return error(format!(
+                    "Invalid FEN. Expected castling rights. Got: {}",
+                    token as char
+                ));
+            }
 
             if token == b'K' || token == b'Q' {
                 // The first rook from the corner, then the king, which castling
@@ -762,7 +877,10 @@ impl<V: Variant> Position<V> {
                     && (self.pieces() & (st.ep_square | (st.ep_square + pawn_push(stm))))
                         .is_empty();
 
-                if V::ATOMIC {
+                if V::ANTICHESS {
+                    legal_ep =
+                        enpassant && self.pieces_c(WHITE).any() && self.pieces_c(BLACK).any();
+                } else if V::ATOMIC {
                     legal_ep = enpassant && self.atomic_ep_is_legal(st.ep_square);
                 } else {
                     while enpassant && pawns.any() && !legal_ep {
@@ -782,12 +900,57 @@ impl<V: Variant> Position<V> {
             st.ep_square = Square::NONE;
         }
 
-        // 5-6. Halfmove clock and fullmove number
-        if let Some(rule50) = ss.read_i32() {
-            st.rule50 = rule50;
-        }
-        if let Some(fullmove) = ss.read_i32() {
-            self.game_ply = fullmove;
+        // 5-6. Remaining checks (Three-check), halfmove clock and fullmove number
+        if V::THREE_CHECK {
+            let mut parsed_checks = None;
+            let mut next = ss.token();
+            if let Some(tok) = next
+                && tok.contains('+')
+                && !tok.starts_with('+')
+            {
+                let Some(checks) = threecheck::parse_remaining_checks(tok) else {
+                    return error(format!("Invalid FEN. Invalid remaining checks: {tok}"));
+                };
+                parsed_checks = Some(checks);
+                next = ss.token();
+            }
+            if let Some(tok) = next {
+                if let Some(rule50) = IStream::new(tok).read_i32() {
+                    st.rule50 = rule50;
+                }
+                if let Some(tok) = ss.token() {
+                    if let Some(fullmove) = IStream::new(tok).read_i32() {
+                        self.game_ply = fullmove;
+                    }
+                    if let Some(tok) = ss.token()
+                        && tok.starts_with('+')
+                    {
+                        if parsed_checks.is_some() {
+                            return error("Invalid FEN. Duplicate remaining checks.");
+                        }
+                        let Some(checks) = threecheck::parse_given_checks(tok) else {
+                            return error(format!("Invalid FEN. Invalid checks given: {tok}"));
+                        };
+                        parsed_checks = Some(checks);
+                    }
+                }
+            }
+            let checks = parsed_checks.unwrap_or(ChecksRemaining::START);
+            if checks.get(WHITE) == 0 && checks.get(BLACK) == 0 {
+                return error("Unsupported position. Both sides have given three checks.");
+            }
+            if checks.is_over() {
+                st.ep_square = Square::NONE;
+            }
+            V::set_checks_remaining(&mut st.extra, WHITE, checks.get(WHITE));
+            V::set_checks_remaining(&mut st.extra, BLACK, checks.get(BLACK));
+        } else {
+            if let Some(rule50) = ss.read_i32() {
+                st.rule50 = rule50;
+            }
+            if let Some(fullmove) = ss.read_i32() {
+                self.game_ply = fullmove;
+            }
         }
 
         // Values above 99 are pointless except to ignore the 50-move rule for
@@ -809,13 +972,15 @@ impl<V: Variant> Position<V> {
         self.set_state(&mut st);
         self.states[0] = st;
 
-        if if V::ATOMIC {
-            self.atomic_checkers_of(!self.side_to_move).any()
-        } else {
-            (self.attackers_to(self.king_square(!self.side_to_move))
-                & self.pieces_c(self.side_to_move))
-            .any()
-        } {
+        if !V::ANTICHESS
+            && if V::ATOMIC {
+                self.atomic_checkers_of(!self.side_to_move).any()
+            } else {
+                (self.attackers_to(self.king_square(!self.side_to_move))
+                    & self.pieces_c(self.side_to_move))
+                .any()
+            }
+        {
             return error("Unsupported position. King can be captured.");
         }
 
@@ -856,6 +1021,13 @@ impl<V: Variant> Position<V> {
     /// do_move.
     #[inline(always)]
     fn set_extra_bitboards(&self, st: &mut StateInfo<V>) {
+        if V::ANTICHESS {
+            st.blockers_for_king = [Bitboard::EMPTY; COLOR_NB];
+            st.pinners = [Bitboard::EMPTY; COLOR_NB];
+            st.check_squares = [Bitboard::EMPTY; PIECE_TYPE_NB];
+            st.threats[ALL_PIECES.idx()].set(Bitboard::EMPTY);
+            return;
+        }
         if V::ATOMIC {
             self.atomic_set_extra_bitboards(st);
             return;
@@ -885,7 +1057,7 @@ impl<V: Variant> Position<V> {
     fn compute_threats(&self) {
         let us = self.side_to_move;
         let them = !us;
-        let occ = if V::ATOMIC && !self.has_king(us) {
+        let occ = if V::ANTICHESS || (V::ATOMIC && !self.has_king(us)) {
             self.pieces()
         } else {
             self.pieces() ^ self.king_square(us)
@@ -917,7 +1089,9 @@ impl<V: Variant> Position<V> {
         st.non_pawn_key = [0; COLOR_NB];
         st.pawn_key = 0;
         st.non_pawn_material = [VALUE_ZERO; COLOR_NB];
-        st.checkers_bb = if V::ATOMIC {
+        st.checkers_bb = if V::ANTICHESS {
+            Bitboard::EMPTY
+        } else if V::ATOMIC {
             self.atomic_checkers_of(self.side_to_move)
         } else {
             self.attackers_to(self.king_square(self.side_to_move))
@@ -951,6 +1125,13 @@ impl<V: Variant> Position<V> {
         }
 
         st.key ^= ZOBRIST.castling[st.castling_rights as usize & 15];
+        if V::THREE_CHECK {
+            st.key ^= ZOBRIST_CHECKS[WHITE.idx()][V::checks_remaining(&st.extra, WHITE) as usize]
+                ^ ZOBRIST_CHECKS[BLACK.idx()][V::checks_remaining(&st.extra, BLACK) as usize];
+        }
+        if V::CRAZYHOUSE {
+            st.key ^= V::crazyhouse_key(&st.extra);
+        }
         st.material_key = self.compute_material_key();
         st.piece_placement = pack_pieces(&self.board);
     }
@@ -975,13 +1156,20 @@ impl<V: Variant> Position<V> {
                     ss += &empty_cnt.to_string();
                 }
                 if f <= FILE_H {
-                    ss.push(PIECE_TO_CHAR[self.piece_on(Square::new(f, r)).idx()] as char);
+                    let sq = Square::new(f, r);
+                    ss.push(PIECE_TO_CHAR[self.piece_on(sq).idx()] as char);
+                    if V::CRAZYHOUSE && self.is_promoted(sq) {
+                        ss.push('~');
+                    }
                     f += 1;
                 }
             }
             if r != RANK_1 {
                 ss.push('/');
             }
+        }
+        if V::CRAZYHOUSE {
+            V::write_hand_fen(&self.st().extra, &mut ss);
         }
 
         ss += if self.side_to_move == WHITE {
@@ -1014,6 +1202,13 @@ impl<V: Variant> Position<V> {
             ss += " - ";
         } else {
             ss += &format!(" {} ", square_to_uci(self.ep_square()));
+        }
+        if V::THREE_CHECK {
+            ss += &format!(
+                "{}+{} ",
+                self.checks_remaining(WHITE),
+                self.checks_remaining(BLACK)
+            );
         }
         ss += &format!(
             "{} {}",
@@ -1175,8 +1370,10 @@ impl<V: Variant> Position<V> {
     pub fn do_null_move(&mut self) {
         debug_assert!(self.checkers().is_empty());
 
+        let prev_extra = self.st().extra;
         // SAFETY: the state is pushed below, before `states` changes.
         let st = unsafe { self.next_state_null() };
+        V::carry_extra(&mut st.extra, &prev_extra);
 
         if st.ep_square != Square::NONE {
             st.key ^= ZOBRIST.enpassant[st.ep_square.file() as usize];
@@ -1240,13 +1437,18 @@ impl<V: Variant> Position<V> {
     /// Tests whether the position is drawn by the 50-move rule or by
     /// repetition. Stalemates are not detected.
     pub fn is_draw(&self, ply: i32) -> bool {
-        if self.st().rule50 > 99
-            && (!self.in_check()
-                || if V::ATOMIC {
-                    self.atomic_has_legal_move()
-                } else {
-                    !MoveList::new::<ALL>(self).is_empty()
-                })
+        if !V::CRAZYHOUSE
+            && self.st().rule50 > 99
+            && if V::ANTICHESS {
+                self.antichess_has_legal_move()
+            } else {
+                !self.in_check()
+                    || if V::ATOMIC {
+                        self.atomic_has_legal_move()
+                    } else {
+                        !MoveList::new::<ALL>(self).is_empty()
+                    }
+            }
         {
             return true;
         }
@@ -1262,10 +1464,14 @@ impl<V: Variant> Position<V> {
     }
 
     /// Tests whether some position repeated since the last capture or pawn
-    /// move.
+    /// move (or since the last null move in Crazyhouse).
     pub fn has_repeated(&self) -> bool {
         let mut idx = self.states.len() - 1;
-        let mut end = self.st().rule50.min(self.st().plies_from_null);
+        let mut end = if V::CRAZYHOUSE {
+            self.st().plies_from_null
+        } else {
+            self.st().rule50.min(self.st().plies_from_null)
+        };
         while end >= 4 {
             if self.states[idx].repetition != 0 {
                 return true;
@@ -1280,9 +1486,17 @@ impl<V: Variant> Position<V> {
     /// matching `is_draw` over all legal moves.
     pub fn upcoming_repetition(&self, ply: i32) -> bool {
         let st = self.st();
-        let end = st.rule50.min(st.plies_from_null);
+        let end = if V::CRAZYHOUSE {
+            st.plies_from_null
+        } else {
+            st.rule50.min(st.plies_from_null)
+        };
 
         if end < 3 {
+            return false;
+        }
+        // In Antichess, mandatory captures prevent quiet repeating moves.
+        if V::ANTICHESS && self.antichess_has_captures() {
             return false;
         }
 
@@ -1297,6 +1511,12 @@ impl<V: Variant> Position<V> {
 
             if other == 0 {
                 let stp = &self.states[idx];
+                // In Three-check, any move into an in-check position decrements
+                // checks_remaining, so an in-check position can never repeat.
+                if V::THREE_CHECK && stp.checkers_bb.any() {
+                    i += 2;
+                    continue;
+                }
                 let move_key = original_key ^ stp.key;
 
                 let mut j = repetition_hash(move_key);
@@ -1312,14 +1532,19 @@ impl<V: Variant> Position<V> {
 
                         // The path must be clear of pieces for a move to be
                         // legal.
-                        if ((between_bb(s1, s2) ^ s2) & self.pieces()).is_empty() {
+                        if ((between_bb(s1, s2) ^ s2) & self.pieces()).is_empty()
+                            && !(V::CRAZYHOUSE && (self.is_promoted(s1) || self.is_promoted(s2)))
+                        {
                             let mut b = st.piece_placement;
                             swap_nibble(&mut b, s1, s2);
 
                             // For nodes before or at the root, check that the
                             // move is a repetition rather than a move to the
                             // current position.
-                            if b == stp.piece_placement && (ply > i || stp.repetition != 0) {
+                            if b == stp.piece_placement
+                                && V::same_extra(&st.extra, &stp.extra)
+                                && (ply > i || stp.repetition != 0)
+                            {
                                 return true;
                             }
                         }
@@ -1359,7 +1584,17 @@ impl<V: Variant> Position<V> {
                 .collect()
         };
 
-        let mut f = placement.split('/').rev().collect::<Vec<_>>().join("/");
+        let (ranks, pocket) = if V::CRAZYHOUSE {
+            if let Some(pos) = placement.find('[') {
+                (&placement[..pos], &placement[pos..])
+            } else {
+                (placement, "")
+            }
+        } else {
+            (placement, "")
+        };
+        let mut f = ranks.split('/').rev().collect::<Vec<_>>().join("/");
+        f += pocket;
         f += if side == "w" { " B " } else { " W " };
         f += castling;
         f += " ";
@@ -1373,9 +1608,17 @@ impl<V: Variant> Position<V> {
             ep.replace_range(1..2, row);
             f += &ep;
         }
-        for field in rest {
+        for (idx, field) in rest.iter().enumerate() {
             f += " ";
-            f += field;
+            if V::THREE_CHECK
+                && idx == 0
+                && let Some(checks) = threecheck::parse_remaining_checks(field)
+            {
+                let swapped = checks.swapped();
+                f += &format!("{}+{}", swapped.get(WHITE), swapped.get(BLACK));
+            } else {
+                f += field;
+            }
         }
 
         let chess960 = self.chess960;
@@ -1389,8 +1632,26 @@ impl<V: Variant> Position<V> {
     /// Consistency checks for debugging, Stockfish's `pos_is_ok`, naming the
     /// first check that fails.
     pub fn check(&self) -> Result<(), &'static str> {
+        if V::ANTICHESS {
+            return self.antichess_check();
+        }
         if V::ATOMIC {
             return self.atomic_check();
+        }
+
+        if V::THREE_CHECK {
+            let w = self.checks_remaining(WHITE);
+            let b = self.checks_remaining(BLACK);
+            if w > MAX_CHECKS || b > MAX_CHECKS || (w == 0 && b == 0) {
+                return Err("pos_is_ok: ThreeCheck");
+            }
+        }
+
+        if V::CRAZYHOUSE
+            && (V::promoted_bb(&self.st().extra) & !(self.pieces() & !self.pieces_pt2(PAWN, KING)))
+                .any()
+        {
+            return Err("pos_is_ok: Crazyhouse promoted");
         }
 
         let stm = self.side_to_move;
@@ -1410,8 +1671,8 @@ impl<V: Variant> Position<V> {
         }
 
         if (self.pieces_pt(PAWN) & (RANK_1_BB | RANK_8_BB)).any()
-            || self.count(WHITE, PAWN) > 8
-            || self.count(BLACK, PAWN) > 8
+            || (!V::CRAZYHOUSE && (self.count(WHITE, PAWN) > 8 || self.count(BLACK, PAWN) > 8))
+            || (V::CRAZYHOUSE && self.crazyhouse_pawns(&self.st().extra) > 16)
         {
             return Err("pos_is_ok: Pawns");
         }
@@ -1439,8 +1700,9 @@ impl<V: Variant> Position<V> {
 
         if (self.pieces_c(WHITE) & self.pieces_c(BLACK)).any()
             || (self.pieces_c(WHITE) | self.pieces_c(BLACK)) != self.pieces()
-            || self.pieces_c(WHITE).popcount() > 16
-            || self.pieces_c(BLACK).popcount() > 16
+            || (!V::CRAZYHOUSE
+                && (self.pieces_c(WHITE).popcount() > 16 || self.pieces_c(BLACK).popcount() > 16))
+            || (V::CRAZYHOUSE && self.pieces().popcount() > 32)
         {
             return Err("pos_is_ok: Bitboards");
         }
@@ -1578,6 +1840,9 @@ impl<V: Variant> Position<V> {
 
     #[inline(always)]
     pub fn moved_piece(&self, m: Move) -> Piece {
+        if V::CRAZYHOUSE && m.is_drop() {
+            return make_piece(self.side_to_move, m.dropped_piece_type());
+        }
         self.piece_on(m.from_sq())
     }
 
@@ -1716,6 +1981,9 @@ impl<V: Variant> Position<V> {
 
     #[inline(always)]
     fn adjust_key50<const AFTER_MOVE: bool>(&self, k: Key) -> Key {
+        if V::CRAZYHOUSE {
+            return k;
+        }
         let threshold = 14 - AFTER_MOVE as i32;
         let rule50 = self.st().rule50;
         if rule50 < threshold {
@@ -1791,10 +2059,14 @@ impl<V: Variant> Position<V> {
     }
 
     /// Whether the capture stage of move generation generates the move: the
-    /// captures and the queen promotions.
+    /// captures and (outside Antichess) the queen promotions.
     #[inline(always)]
     pub fn capture_stage(&self, m: Move) -> bool {
         debug_assert!(m.is_ok());
+
+        if V::ANTICHESS {
+            return self.capture(m);
+        }
 
         let mt = m.type_of();
         if mt == NORMAL {
@@ -2127,8 +2399,8 @@ impl<V: Variant> Position<V> {
     }
 }
 
-/// The rules of chess, which the `Variant` implementation of `Chess` calls.
-impl Position<Chess> {
+/// The rules of chess, which `Chess` and `ThreeCheck` share.
+impl<V: Variant> Position<V> {
     /// Tests whether a move, possibly corrupt as moves from the transposition
     /// table can be, is legal.
     pub(crate) fn chess_legal(&self, m: Move) -> bool {
@@ -2268,8 +2540,10 @@ impl Position<Chess> {
 
         let mut k = self.st().key ^ ZOBRIST.side;
         let previous_blockers = self.st().blockers_for_king;
+        let prev_extra = self.st().extra;
         // SAFETY: the state is pushed below, before `states` changes.
         let st = unsafe { self.next_state() };
+        V::carry_extra(&mut st.extra, &prev_extra);
 
         // The ply counters; rule50 is reset below for captures and pawn moves.
         self.game_ply += 1;
@@ -2294,6 +2568,13 @@ impl Position<Chess> {
         } else {
             self.piece_on(to)
         };
+
+        if V::THREE_CHECK && gives_check {
+            let old = V::checks_remaining(&st.extra, us);
+            let new = old.saturating_sub(1);
+            V::set_checks_remaining(&mut st.extra, us, new);
+            k ^= ZOBRIST_CHECKS[us.idx()][old as usize] ^ ZOBRIST_CHECKS[us.idx()][new as usize];
+        }
 
         dp.pc = pc;
         dp.from = from;
@@ -2351,12 +2632,19 @@ impl Position<Chess> {
             dp.remove_sq = capsq;
 
             k ^= ZOBRIST.psq[captured.idx()][capsq.idx()];
+            if V::CRAZYHOUSE {
+                k ^= V::on_crazyhouse_capture(&mut st.extra, us, capsq, captured.type_of());
+            }
             let remaining = self.piece_count[captured.idx()] - (m.type_of() != EN_PASSANT) as i32;
             st.material_key ^= ZOBRIST.psq[captured.idx()][(8 + remaining) as usize & 63];
 
             st.rule50 = 0;
         } else {
             dp.remove_sq = Square::NONE;
+        }
+
+        if V::CRAZYHOUSE && m.type_of() != CASTLING && m.type_of() != PROMOTION {
+            k ^= V::on_crazyhouse_move(&mut st.extra, from, to);
         }
 
         k ^= ZOBRIST.psq[pc.idx()][from.idx()] ^ ZOBRIST.psq[pc.idx()][to.idx()];
@@ -2387,7 +2675,10 @@ impl Position<Chess> {
                     // Otherwise a pawn that was not blocking a check on its
                     // king, or that stays on the line through the king, can
                     // take.
-                    if no_discovery && (pawns & (not_blockers | line_bb(ep_square, ksq))).any() {
+                    if no_discovery
+                        && !(V::THREE_CHECK && V::checks_remaining(&st.extra, us) == 0)
+                        && (pawns & (not_blockers | line_bb(ep_square, ksq))).any()
+                    {
                         st.ep_square = ep_square;
                         k ^= ZOBRIST.enpassant[ep_square.file() as usize];
                     }
@@ -2406,6 +2697,9 @@ impl Position<Chess> {
                 // The pawn's key on the last rank is zero, so there is no need
                 // to clear it.
                 k ^= ZOBRIST.psq[promotion.idx()][to.idx()];
+                if V::CRAZYHOUSE {
+                    k ^= V::on_crazyhouse_promotion(&mut st.extra, to);
+                }
                 st.material_key ^= ZOBRIST.psq[promotion.idx()]
                     [(8 + self.piece_count[promotion.idx()]) as usize & 63]
                     ^ ZOBRIST.psq[pc.idx()][(8 + self.piece_count[pc.idx()] - 1) as usize & 63];
@@ -2472,13 +2766,20 @@ impl Position<Chess> {
         // occur since the last irreversible move. The piece placement, in
         // addition to the key, makes it exact.
         st.repetition = 0;
-        let end = st.rule50.min(st.plies_from_null);
+        let end = if V::CRAZYHOUSE {
+            st.plies_from_null
+        } else {
+            st.rule50.min(st.plies_from_null)
+        };
         if end >= 4 {
             let n = self.states.len();
             let mut i = 4;
             while i <= end {
                 let stp = &self.states[n - i as usize];
-                if stp.key == st.key && stp.piece_placement == st.piece_placement {
+                if stp.key == st.key
+                    && stp.piece_placement == st.piece_placement
+                    && V::same_extra(&stp.extra, &st.extra)
+                {
                     st.repetition = if stp.repetition != 0 { -i } else { i };
                     break;
                 }
@@ -2564,29 +2865,41 @@ impl Position<Chess> {
     pub(crate) fn chess_see_ge(&self, m: Move, threshold: i32) -> bool {
         debug_assert!(m.is_ok());
 
-        // Only normal moves are evaluated; the others pass a simple SEE.
+        // Only normal moves (and Crazyhouse drops) are evaluated; the others
+        // pass a simple SEE.
         if m.type_of() != NORMAL {
             return VALUE_ZERO >= threshold;
         }
 
+        let is_drop = V::CRAZYHOUSE && m.is_drop();
         let from = m.from_sq();
         let to = m.to_sq();
 
-        debug_assert!(self.piece_on(from) != NO_PIECE);
+        debug_assert!(is_drop || self.piece_on(from) != NO_PIECE);
 
         let mut swap = self.piece_on(to).value() - threshold;
         if swap < 0 {
             return false;
         }
 
-        swap = self.piece_on(from).value() - swap;
+        let moved_val = if is_drop {
+            PIECE_VALUE[m.dropped_piece_type().idx()]
+        } else {
+            self.piece_on(from).value()
+        };
+        swap = moved_val - swap;
         if swap <= 0 {
             return true;
         }
 
-        debug_assert!(self.piece_on(from).color() == self.side_to_move);
-        // Removing `to` matters for the pinned-piece logic.
-        let mut occupied = self.pieces() ^ from ^ to;
+        debug_assert!(is_drop || self.piece_on(from).color() == self.side_to_move);
+        // Removing `to` matters for the pinned-piece logic; for a drop `to` is
+        // already empty in `self.pieces()`.
+        let mut occupied = if is_drop {
+            self.pieces()
+        } else {
+            self.pieces() ^ from ^ to
+        };
         let mut stm = self.side_to_move;
         let mut attackers = self.attackers_to_occ(to, occupied);
         let mut res = 1;

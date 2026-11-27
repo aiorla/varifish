@@ -22,7 +22,7 @@ use crate::score::Score;
 use crate::search::{InfoFull, InfoIteration, InfoShort, LimitsType};
 use crate::thread::lock;
 use crate::types::*;
-use crate::variant::{Atomic, Chess, Variant, VariantKind};
+use crate::variant::{Antichess, Atomic, Chess, Crazyhouse, ThreeCheck, Variant, VariantKind};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -399,6 +399,15 @@ impl UciEngine {
         let result = match variant {
             VariantKind::Chess => perft::<Chess>(&fen, limits.perft, chess960, on_root_move),
             VariantKind::Atomic => perft::<Atomic>(&fen, limits.perft, chess960, on_root_move),
+            VariantKind::ThreeCheck => {
+                perft::<ThreeCheck>(&fen, limits.perft, chess960, on_root_move)
+            }
+            VariantKind::Crazyhouse => {
+                perft::<Crazyhouse>(&fen, limits.perft, chess960, on_root_move)
+            }
+            VariantKind::Antichess => {
+                perft::<Antichess>(&fen, limits.perft, chess960, on_root_move)
+            }
         };
 
         match result {
@@ -520,7 +529,10 @@ pub fn format_score(s: &Score) -> String {
     const TB_CP: i32 = 20000;
     match *s {
         Score::Mate { plies } => {
-            let m = (if plies > 0 { plies + 1 } else { plies }) / 2;
+            // Moves, rounded away from zero: a side to move is mated at an
+            // even ply in chess, but loses at an odd one in Antichess, when
+            // the opponent is left without a move.
+            let m = (if plies > 0 { plies + 1 } else { plies - 1 }) / 2;
             format!("mate {m}")
         }
         Score::Tablebase { plies, win } => {
@@ -562,6 +574,11 @@ pub fn move_to_uci(m: Move, chess960: bool) -> String {
         return "0000".to_string();
     }
 
+    if m.is_drop() {
+        let ch = b" PNBRQK"[m.dropped_piece_type().idx()] as char;
+        return format!("{ch}@{}", square_to_uci(m.to_sq()));
+    }
+
     let from = m.from_sq();
     let mut to = m.to_sq();
 
@@ -573,6 +590,8 @@ pub fn move_to_uci(m: Move, chess960: bool) -> String {
 
     if m.type_of() == PROMOTION {
         s.push(b" pnbrqk"[m.promotion_type().idx()] as char);
+    } else if m.is_king_promotion() {
+        s.push('k');
     }
 
     s
@@ -581,12 +600,10 @@ pub fn move_to_uci(m: Move, chess960: bool) -> String {
 /// The legal move written `s` in UCI notation, in any case, or
 /// `Move::none()`.
 pub fn to_move<V: Variant>(pos: &Position<V>, s: &str) -> Move {
-    let s = s.to_ascii_lowercase();
-
     MoveList::new::<ALL>(pos)
         .iter()
         .copied()
-        .find(|&m| move_to_uci(m, pos.is_chess960()) == s)
+        .find(|&m| move_to_uci(m, pos.is_chess960()).eq_ignore_ascii_case(s))
         .unwrap_or(Move::none())
 }
 
@@ -653,7 +670,6 @@ mod tests {
     use crate::engine::{MAX_HASH_MB, available_processors};
     use crate::nnue::architecture::RAW_LAYER_STACKS;
     use crate::nnue::atomic::AtomicNetwork;
-    use crate::nnue::atomic::network::Network as LegacyAtomicNetwork;
     use crate::nnue::eval_file::{EvalFile, Networks};
     use crate::nnue::network::Network as ChessNetwork;
 
@@ -677,8 +693,12 @@ mod tests {
     }
 
     /// An engine with networks of zeros, and its output and error output.
+    /// Atomic's stores 4 layer stacks, the others falling back to the
+    /// first.
     fn engine_with_network() -> (UciEngine, Buffer, Buffer) {
-        engine_with_atomic_network(AtomicNetwork::Legacy(LegacyAtomicNetwork::zeroed()))
+        engine_with_atomic_network(AtomicNetwork::Sfnnv20(
+            crate::nnue::atomic::sfnnv20::Network::zeroed(4),
+        ))
     }
 
     /// An engine with chess's network of zeros, which stores every layer
@@ -688,6 +708,9 @@ mod tests {
         engine.engine.set_networks(Networks {
             chess: EvalFile::with_network(ChessNetwork::zeroed_with_stacks(RAW_LAYER_STACKS)),
             atomic: EvalFile::with_network(atomic.boxed()),
+            threecheck: EvalFile::default(),
+            crazyhouse: EvalFile::default(),
+            antichess: EvalFile::default(),
         });
         (engine, out, err)
     }
@@ -752,7 +775,7 @@ mod tests {
                  option name Move Overhead type spin default 10 min 0 max 5000\n\
                  option name nodestime type spin default 0 min 0 max 10000\n\
                  option name UCI_Chess960 type check default false\n\
-                 option name UCI_Variant type combo default chess var chess var atomic\n\
+                 option name UCI_Variant type combo default chess var chess var atomic var 3check var crazyhouse var antichess\n\
                  option name UCI_LimitStrength type check default false\n\
                  option name UCI_Elo type spin default 1320 min 1320 max 3190\n\
                  option name UCI_ShowWDL type check default false\n\
@@ -1076,8 +1099,9 @@ mod tests {
 
     const ATOMIC: &str = "setoption name UCI_Variant value atomic\n";
 
-    const ATOMIC_NETWORK_INFO: &str = "info string NNUE evaluation using Legacy Atomic V1 \
-                                       atomic-b0d279b9e021.nnue (45MiB, (45056, 1024, 16, 32, 1))\n\
+    const ATOMIC_NETWORK_INFO: &str = "info string NNUE evaluation using Atomic \
+                                       FullThreats+PP_3Wide+K32H3 SFNNv20 \
+                                       atomic-b0d279b9e021.nnue (128MiB, (131952, 1024, 32, 32, 1))\n\
                                        info string Network replica 1: Local memory.\n";
 
     #[test]
@@ -1117,51 +1141,6 @@ mod tests {
                  info string ERROR: The engine will be terminated now.\n",
                 go_info(1)
             )
-        );
-    }
-
-    #[test]
-    fn atomic_eval_traces_the_material_and_the_layers() {
-        let (code, out) = run(&format!("{ATOMIC}eval\n"));
-        assert_eq!(code, 0);
-        let buckets: String = (0..8)
-            .map(|b| {
-                let used = if b == 7 {
-                    " <-- this bucket is used"
-                } else {
-                    ""
-                };
-                format!("|  {b}         |     0.00   |     0.00   |     0.00   |{used}\n")
-            })
-            .collect();
-        assert_eq!(
-            out,
-            format!(
-                "{ATOMIC_NETWORK_INFO}\n\nNNUE network contributions (Normalized, White to move)\n\
-                 +------------+------------+------------+------------+\n\
-                 |   Bucket   |  Material  | Positional |   Total    |\n\
-                 |            |   (PSQT)   |  (Layers)  |            |\n\
-                 +------------+------------+------------+------------+\n\
-                 {buckets}\
-                 +------------+------------+------------+------------+\n\n\
-                 NNUE evaluation          +0 (side to move, internal units)\n\
-                 NNUE evaluation        +0.00 (white side)\n\
-                 Final evaluation      +0.00 (white side) [Use NNUE=true]\n\n"
-            )
-        );
-
-        // Atomic-Stockfish evaluates positions in check too, but none
-        // without a king.
-        let (_, out) = run(&format!(
-            "{ATOMIC}position startpos moves e2e4 d7d5 f1b5\neval\n"
-        ));
-        assert!(out.contains("\nFinal evaluation      +0.00 (white side) [Use NNUE=true]\n"));
-        let (_, out) = run(&format!(
-            "{ATOMIC}position fen k7/1p6/8/8/8/8/8/4K2Q w - - 0 1 moves h1b7\neval\n"
-        ));
-        assert_eq!(
-            out,
-            format!("{ATOMIC_NETWORK_INFO}\nFinal evaluation: none (Atomic terminal)\n")
         );
     }
 
@@ -1225,17 +1204,9 @@ mod tests {
         }
     }
 
-    /// An engine whose Atomic network is one of zeros in Stockfish's design.
-    /// It stores 4 layer stacks, the others falling back to the first.
-    fn engine_with_sfnnv20_network() -> (UciEngine, Buffer, Buffer) {
-        engine_with_atomic_network(AtomicNetwork::Sfnnv20(
-            crate::nnue::atomic::sfnnv20::Network::zeroed(4),
-        ))
-    }
-
     #[test]
     fn atomic_evaluates_with_a_network_in_stockfish_design() {
-        let (code, out) = run_with(engine_with_sfnnv20_network(), &format!("{ATOMIC}eval\n"));
+        let (code, out) = run(&format!("{ATOMIC}eval\n"));
         assert_eq!(code, 0);
         // All 32 pieces and both queens: a raw stack the file does not
         // store, which falls back to the first.
@@ -1252,9 +1223,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "info string NNUE evaluation using Atomic FullThreats+PP_3Wide+K32H3 SFNNv20 \
-                 atomic-b0d279b9e021.nnue (128MiB, (131952, 1024, 32, 32, 1))\n\
-                 info string Network replica 1: Local memory.\n\n\n\
+                "{ATOMIC_NETWORK_INFO}\n\n\
                  NNUE network contributions (Normalized, White to move)\n\
                  +------------+------------+\n\
                  |   Bucket   | Evaluation |\n\
@@ -1267,21 +1236,29 @@ mod tests {
             )
         );
 
+        // Atomic-Stockfish evaluates positions in check too, but none
+        // without a king.
+        let (_, out) = run(&format!(
+            "{ATOMIC}position startpos moves e2e4 d7d5 f1b5\neval\n"
+        ));
+        assert!(out.contains("\nFinal evaluation      +0.00 (white side) [Use NNUE=true]\n"));
+        let (_, out) = run(&format!(
+            "{ATOMIC}position fen k7/1p6/8/8/8/8/8/4K2Q w - - 0 1 moves h1b7\neval\n"
+        ));
+        assert_eq!(
+            out,
+            format!("{ATOMIC_NETWORK_INFO}\nFinal evaluation: none (Atomic terminal)\n")
+        );
+
         // Searches update its accumulators through the explosions: the
         // queen explodes the king by taking the pawn next to it, and a
         // longer search plays on.
         let fen = "k7/1p6/8/8/8/8/8/4K2Q w - - 0 1";
-        let out = search_with(
-            engine_with_sfnnv20_network(),
-            &[ATOMIC.trim(), &format!("position fen {fen}"), "go depth 3"],
-        );
+        let out = search(&[ATOMIC.trim(), &format!("position fen {fen}"), "go depth 3"]);
         let lines = output_lines(&out);
         assert!(lines[2].contains(" score mate 1 "), "{out}");
         assert_eq!(*lines.last().unwrap(), "bestmove h1b7", "{out}");
-        let out = search_with(
-            engine_with_sfnnv20_network(),
-            &[ATOMIC.trim(), "position startpos", "go depth 8"],
-        );
+        let out = search(&[ATOMIC.trim(), "position startpos", "go depth 8"]);
         assert!(
             output_lines(&out).last().unwrap().starts_with("bestmove "),
             "{out}"
@@ -1327,6 +1304,9 @@ mod tests {
         assert_eq!(format_score(&Score::Mate { plies: 1 }), "mate 1");
         assert_eq!(format_score(&Score::Mate { plies: 4 }), "mate 2");
         assert_eq!(format_score(&Score::Mate { plies: -2 }), "mate -1");
+        assert_eq!(format_score(&Score::Mate { plies: -1 }), "mate -1");
+        assert_eq!(format_score(&Score::Mate { plies: -3 }), "mate -2");
+        assert_eq!(format_score(&Score::Mate { plies: -4 }), "mate -2");
         assert_eq!(format_score(&Score::Mate { plies: 0 }), "mate 0");
         assert_eq!(
             format_score(&Score::Tablebase {
@@ -1384,5 +1364,277 @@ mod tests {
         );
         assert_eq!(pawns("4k2r/ppppp3/8/8/8/8/PPPP4/4K1N1 w - - 0 1"), 181);
         assert_eq!(pawns("4k3/pppp4/8/8/8/8/PPPP4/4K3 w - - 0 1"), 181);
+    }
+
+    #[test]
+    fn three_check_searches_find_third_check_wins() {
+        const THREE_CHECK: &str = "setoption name UCI_Variant value 3check";
+
+        // 1 check remaining: quiet check wins immediately (mate in 1).
+        let out = search(&[
+            THREE_CHECK,
+            "position fen 4k3/8/8/8/8/8/3R4/4K3 w - - 1+3 0 1",
+            "go depth 3",
+        ]);
+        assert!(out.contains("score mate 1"), "{out}");
+        assert!(
+            out.contains("bestmove d2e2") || out.contains("bestmove d2d8"),
+            "{out}"
+        );
+
+        // 2 checks remaining: no checkmate possible, only a forced 2nd + 3rd check (mate in 2).
+        let out = search(&[
+            THREE_CHECK,
+            "position fen 4k3/8/8/8/8/8/1Q6/4K3 w - - 2+3 0 1",
+            "go depth 5",
+        ]);
+        assert!(out.contains("score mate 2"), "{out}");
+
+        // Already 0 checks remaining for White -> Black has lost at depth 0.
+        let out = search(&[
+            THREE_CHECK,
+            "position fen 4k3/8/8/8/8/8/4R3/4K3 b - - 0+3 0 1",
+            "go depth 3",
+        ]);
+        assert!(out.contains("score mate 0"), "{out}");
+        assert!(out.contains("bestmove (none)"), "{out}");
+    }
+
+    #[test]
+    fn three_check_perft_eval_and_dedicated_network() {
+        // Perft needs no network.
+        let (code, out) = run_with(
+            engine(),
+            "setoption name UCI_Variant value 3check\ngo perft 2\nquit\n",
+        );
+        assert_eq!(code, 0);
+        assert!(out.contains("Nodes searched: 400"), "{out}");
+
+        // Bootstrap eval prints checks bonus.
+        let (code, out) = run("setoption name UCI_Variant value 3check\n\
+             position fen 4k3/8/8/8/8/8/8/4K3 w - - 1+3 0 1\n\
+             eval\n\
+             quit\n");
+        assert_eq!(code, 0);
+        assert!(out.contains("Three-check bootstrap"), "{out}");
+        assert!(out.contains("Checks bonus"), "{out}");
+
+        // Dedicated ThreeCheckNetwork loads and evaluates without bootstrap bonus.
+        let (mut eng, out_buf, _err_buf) = engine();
+        let net = crate::nnue::threecheck::ThreeCheckNetwork::zeroed_with_stacks(
+            crate::nnue::threecheck::RAW_LAYER_STACKS,
+        );
+        eng.engine.set_networks(Networks {
+            chess: EvalFile::default(),
+            atomic: EvalFile::default(),
+            threecheck: EvalFile::with_network(net),
+            crazyhouse: EvalFile::default(),
+            antichess: EvalFile::default(),
+        });
+        let (code, out) = run_with(
+            (eng, out_buf, _err_buf),
+            "setoption name UCI_Variant value 3check\n\
+             position fen 4k3/8/8/8/8/8/8/4K3 w - - 1+3 0 1\n\
+             eval\n\
+             quit\n",
+        );
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("Three-check FullThreats+PP_3Wide+K32H3+Checks SFNNv20"),
+            "{out}"
+        );
+        assert!(!out.contains("Checks bonus"), "{out}");
+    }
+
+    #[test]
+    fn crazyhouse_searches_eval_and_dedicated_network() {
+        const CRAZYHOUSE: &str = "setoption name UCI_Variant value crazyhouse";
+
+        // Perft needs no network.
+        let (code, out) = run_with(
+            engine(),
+            "setoption name UCI_Variant value crazyhouse\n\
+             position fen 2k5/8/8/8/8/8/8/4K3[QRBNPqrbnp] w - - 0 1\n\
+             go perft 2\n\
+             quit\n",
+        );
+        assert_eq!(code, 0);
+        assert!(out.contains("Nodes searched: 75353"), "{out}");
+
+        // Smothered mate in 1 by knight drop (N@f7#) and case-insensitive drop moves.
+        let out = search(&[
+            CRAZYHOUSE,
+            "position fen 6rk/6pp/8/8/8/8/8/4K3[N] w - - 0 1",
+            "go depth 4",
+        ]);
+        assert!(out.contains("score mate 1"), "{out}");
+        assert!(out.contains("bestmove N@f7"), "{out}");
+
+        let out = search(&[
+            CRAZYHOUSE,
+            "position fen 4k3/8/8/8/8/8/8/4K3[P] w - - 0 1 moves p@e4",
+            "d",
+        ]);
+        assert!(out.contains("4k3/8/8/8/4P3/8/8/4K3[] b - - 0 1"), "{out}");
+
+        // Bootstrap eval prints hand material bonus.
+        let (code, out) = run("setoption name UCI_Variant value crazyhouse\n\
+             position fen 4k3/8/8/8/8/8/8/4K3[QN] w - - 0 1\n\
+             eval\n\
+             quit\n");
+        assert_eq!(code, 0);
+        assert!(out.contains("Crazyhouse bootstrap"), "{out}");
+        assert!(out.contains("Hand bonus"), "{out}");
+
+        // Dedicated CrazyhouseNetwork loads and evaluates without bootstrap bonus.
+        let (mut eng, out_buf, _err_buf) = engine();
+        let net = crate::nnue::crazyhouse::CrazyhouseNetwork::zeroed_with_stacks(
+            crate::nnue::crazyhouse::RAW_LAYER_STACKS,
+        );
+        eng.engine.set_networks(Networks {
+            chess: EvalFile::default(),
+            atomic: EvalFile::default(),
+            threecheck: EvalFile::default(),
+            crazyhouse: EvalFile::with_network(net),
+            antichess: EvalFile::default(),
+        });
+        let (code, out) = run_with(
+            (eng, out_buf, _err_buf),
+            "setoption name UCI_Variant value crazyhouse\n\
+             position fen 4k3/8/8/8/8/8/8/4K3[QN] w - - 0 1\n\
+             eval\n\
+             quit\n",
+        );
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("Crazyhouse FullThreats+PP_3Wide+K32H3+Hands SFNNv20"),
+            "{out}"
+        );
+        assert!(!out.contains("Hand bonus"), "{out}");
+    }
+
+    #[test]
+    fn antichess_searches_eval_and_dedicated_network() {
+        const ANTICHESS: &str = "setoption name UCI_Variant value antichess";
+
+        // Perft from startpos at depth 3 (8067 in Lichess Antichess).
+        let (code, out) = run_with(
+            engine(),
+            "setoption name UCI_Variant value antichess\n\
+             position startpos\n\
+             go perft 3\n\
+             quit\n",
+        );
+        assert_eq!(code, 0);
+        assert!(out.contains("Nodes searched: 8067"), "{out}");
+
+        // King promotion move in UCI (`e7e8k`).
+        let out = search(&[
+            ANTICHESS,
+            "position fen 8/4P3/8/8/8/8/6p1/8 w - - 0 1 moves e7e8k",
+            "d",
+        ]);
+        assert!(out.contains("4K3/8/8/8/8/8/6p1/8 b - - 0 1"), "{out}");
+
+        // White wins in 1 by forcing Black to capture White's last piece (a6 -> b7xa6).
+        let out = search(&[
+            ANTICHESS,
+            "position fen 8/1p6/8/P7/8/8/8/8 w - - 0 1",
+            "go depth 4",
+        ]);
+        assert!(out.contains("score mate 1"), "{out}");
+        assert!(out.contains("bestmove a5a6"), "{out}");
+
+        // Stalemate is an immediate win at the root (`score mate 0`).
+        let out = search(&[
+            ANTICHESS,
+            "position fen 8/8/8/8/8/p7/P7/8 w - - 0 1",
+            "go depth 2",
+        ]);
+        assert!(out.contains("score mate 0"), "{out}");
+        assert!(out.contains("bestmove (none)"), "{out}");
+
+        // A loss in one ply, here by taking White's last piece, is a loss in
+        // one move.
+        let out = search_with(
+            engine(),
+            &[
+                ANTICHESS,
+                "position fen 8/8/8/8/8/8/5K2/6k1 b - - 0 1",
+                "go depth 2",
+            ],
+        );
+        assert!(out.contains("score mate -1"), "{out}");
+        assert!(out.contains("bestmove g1f2"), "{out}");
+
+        // Most of White's moves lose at once here (Black's rook takes a pawn
+        // and the queen has to take it), but not all: the search must not
+        // report a loss, as it did when positions shared keys.
+        let out = search_with(
+            engine(),
+            &[
+                ANTICHESS,
+                "position fen 8/Q7/5N2/8/P5P1/8/r1PP1P2/8 w - - 0 19",
+                "go depth 3",
+            ],
+        );
+        assert!(!out.contains("score mate"), "{out}");
+        assert!(!out.contains("bestmove c2c3"), "{out}");
+
+        // The capture search is bounded: with the queens loose, a depth 1
+        // search took millions of nodes when qsearch played every capture
+        // out.
+        let out = search_with(
+            engine(),
+            &[
+                ANTICHESS,
+                "position fen rnb1k1nr/pppp1ppp/4p3/6q1/1P6/8/PPQPPPPP/RNB1KBNR w - - 0 1",
+                "go depth 1",
+            ],
+        );
+        let nodes: u64 = out
+            .lines()
+            .rev()
+            .find_map(|line| line.split(" nodes ").nth(1))
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|nodes| nodes.parse().ok())
+            .unwrap_or_else(|| panic!("no nodes in {out}"));
+        assert!(nodes < 1000, "{nodes} nodes: {out}");
+
+        // Bootstrap classical eval runs without any network file loaded.
+        let (code, out) = run("setoption name UCI_Variant value antichess\n\
+             position startpos\n\
+             eval\n\
+             quit\n");
+        assert_eq!(code, 0);
+        assert!(out.contains("Antichess bootstrap"), "{out}");
+
+        // Dedicated AntichessNetwork loads and evaluates without bootstrap.
+        let (mut eng, out_buf, _err_buf) = engine();
+        let net = crate::nnue::antichess::AntichessNetwork::zeroed_with_stacks(
+            crate::nnue::antichess::RAW_LAYER_STACKS,
+        );
+        eng.engine.set_networks(Networks {
+            chess: EvalFile::default(),
+            atomic: EvalFile::default(),
+            threecheck: EvalFile::default(),
+            crazyhouse: EvalFile::default(),
+            antichess: EvalFile::with_network(net),
+        });
+        let (code, out) = run_with(
+            (eng, out_buf, _err_buf),
+            "setoption name UCI_Variant value antichess\n\
+             position startpos\n\
+             eval\n\
+             go depth 2\n\
+             quit\n",
+        );
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("Antichess Threats+PP_3Wide+Psq SFNNv20"),
+            "{out}"
+        );
+        assert!(!out.contains("Antichess bootstrap"), "{out}");
+        assert!(out.contains("bestmove "), "{out}");
     }
 }

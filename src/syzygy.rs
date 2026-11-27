@@ -28,7 +28,7 @@ use crate::movegen::{ALL, MoveList};
 use crate::position::{Position, material_key_of};
 use crate::search::RootMove;
 use crate::types::*;
-use crate::variant::{Atomic, Chess, Variant, VariantKind};
+use crate::variant::{Antichess, Atomic, Chess, Crazyhouse, ThreeCheck, Variant, VariantKind};
 
 /// How a variant's tables are stored and indexed.
 pub struct SyzygyFormat {
@@ -60,6 +60,20 @@ pub const ATOMIC: SyzygyFormat = SyzygyFormat {
     max_pieces: 6,
     connected_kings: true,
 };
+
+/// Three-check has no Syzygy tablebases.
+pub const THREE_CHECK: SyzygyFormat = SyzygyFormat {
+    suffixes: ["", ""],
+    magics: [[0; 4]; 2],
+    max_pieces: 0,
+    connected_kings: false,
+};
+
+/// Crazyhouse has no Syzygy tablebases.
+pub const CRAZYHOUSE: SyzygyFormat = THREE_CHECK;
+
+/// Antichess tablebases are not yet wired into varifish's Syzygy prober.
+pub const ANTICHESS: SyzygyFormat = THREE_CHECK;
 
 /// The most pieces of the tables of any variant
 const TBPIECES: usize = 7;
@@ -754,6 +768,9 @@ impl<V: Variant> Default for Tables<V> {
 pub struct Tablebases {
     pub chess: Tables<Chess>,
     pub atomic: Tables<Atomic>,
+    pub threecheck: Tables<ThreeCheck>,
+    pub crazyhouse: Tables<Crazyhouse>,
+    pub antichess: Tables<Antichess>,
 }
 
 impl Tablebases {
@@ -771,6 +788,7 @@ impl Tablebases {
                 self.atomic = Tables::new(paths);
                 self.atomic.info()
             }
+            VariantKind::ThreeCheck | VariantKind::Crazyhouse | VariantKind::Antichess => None,
         }
     }
 }

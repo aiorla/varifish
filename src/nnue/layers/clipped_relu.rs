@@ -41,6 +41,7 @@ impl<const IN: usize, const W: i32> ClippedReLU<IN, W> {
     pub fn write_parameters(&self, _: &mut Vec<u8>) {}
 
     /// Forward propagation
+    #[cfg(not(use_pair_activations))]
     #[inline(always)]
     pub fn propagate(&self, input: &[i32; IN], output: &mut [u8; IN]) {
         #[cfg(use_neon)]
@@ -92,7 +93,7 @@ impl<const IN: usize, const W: i32> ClippedReLU<IN, W> {
             num_chunks * 16
         };
 
-        #[cfg(not(any(use_neon, all(use_sse2, not(use_avx2)))))]
+        #[cfg(not(any(use_neon, use_sse2)))]
         let start = 0;
 
         for i in start..IN {

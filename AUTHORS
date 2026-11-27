@@ -1,13 +1,16 @@
 # varifish translates Stockfish into Rust, so Stockfish's authors, listed
 # below as of the commit varifish follows (see Cargo.toml), are its authors
 # too, together with varifish's own contributors and, for its Atomic, the
-# authors of Atomic-Stockfish, from which that derives.
+# authors of Atomic-Stockfish, from which that derives, and of
+# Fairy-Stockfish, whose rules and search its variants follow in part.
 
 # varifish's contributors
 aiorla
 
-# Atomic-Stockfish (https://github.com/Belzedar94/Atomic-Stockfish), and the
-# Fairy-Stockfish lineage of its Atomic rules and networks
+# Atomic-Stockfish (https://github.com/Belzedar94/Atomic-Stockfish), and
+# Fairy-Stockfish (https://github.com/fairy-stockfish/Fairy-Stockfish), from
+# which Atomic's rules and networks descend and parts of the variants' search
+# come
 Belzedar94 (project lead)
 Fabian Fichter (ianfab)
 The Fairy-Stockfish contributors

@@ -1,8 +1,8 @@
 # For a version's tag (v0.1.0, say), builds varifish for Linux, Windows and
 # macOS, for each ARCH of Stockfish's releases that its Makefile takes, with
 # the default network embedded, and attaches the archives to a draft
-# release, to be checked and published by hand. Atomic's network is not
-# included: the release `networks` has it. The Linux builds for x86-64-avx2
+# release, to be checked and published by hand. The variants' networks are
+# not included: the release `networks` has them. The Linux builds for x86-64-avx2
 # and x86-64-bmi2 are laid out by BOLT, as `make bolt` does.
 name: release
 on:
@@ -71,13 +71,25 @@ jobs:
         if: matrix.bench
         run: |
           ./"$exe" bench 2>&1 | tee bench.txt
-          grep -q "^Nodes searched  : 1488683$" bench.txt
+          grep -q "^Nodes searched  : 1210779$" bench.txt
       - name: Atomic's bench too, where BOLT moved the code
         if: matrix.bolt
         run: |
           printf 'setoption name UCI_Variant value atomic\nsetoption name EvalFile value %s\nbench\nquit\n' \
             nets/atomic-b0d279b9e021.nnue | ./"$exe" 2>&1 | tee atomic.txt
-          grep -q "^Nodes searched  : 354072$" atomic.txt
+          grep -q "^Nodes searched  : 335537$" atomic.txt
+      - name: Three-check's, Crazyhouse's and Antichess's benches, which BOLT moved too
+        if: matrix.bolt
+        run: |
+          printf 'setoption name UCI_Variant value 3check\nsetoption name EvalFile value %s\nbench\nquit\n' \
+            nets/3check-ae396b7e8123.nnue | ./"$exe" 2>&1 | tee 3check.txt
+          grep -q "^Nodes searched  : 123759$" 3check.txt
+          printf 'setoption name UCI_Variant value crazyhouse\nsetoption name EvalFile value %s\nbench\nquit\n' \
+            nets/crazyhouse-b39a7a9b9831.nnue | ./"$exe" 2>&1 | tee crazyhouse.txt
+          grep -q "^Nodes searched  : 378665$" crazyhouse.txt
+          printf 'setoption name UCI_Variant value antichess\nsetoption name EvalFile value %s\nbench\nquit\n' \
+            nets/antichess-64def68f336c.nnue | ./"$exe" 2>&1 | tee antichess.txt
+          grep -q "^Nodes searched  : 3011693$" antichess.txt
       - name: The archive, with the license, the authors and the guide
         run: |
           name=varifish-$GITHUB_REF_NAME-${{ matrix.platform }}-${{ matrix.arch }}

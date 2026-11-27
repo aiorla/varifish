@@ -8,7 +8,10 @@
 //! developers (see AUTHORS), under the GNU General Public License, version 3
 //! or later.
 
+pub mod antichess;
 pub mod atomic;
+pub mod crazyhouse;
+pub mod threecheck;
 
 use std::fmt::Write;
 
@@ -17,13 +20,14 @@ use crate::nnue::network::Network;
 use crate::position::Position;
 use crate::types::*;
 use crate::uci::to_cp;
+use crate::variant::Variant;
 
 // The default net name MUST follow the format nn-[SHA256 first 12 digits].nnue
 // for the build process to work: build.rs and the Makefile read it from this
 // line, which must stay as it is.
 pub const EVAL_FILE_DEFAULT_NAME: &str = "nn-bddd9d57eb87.nnue";
 
-fn simple_eval(pos: &Position) -> i32 {
+fn simple_eval<V: Variant>(pos: &Position<V>) -> i32 {
     let c = pos.side_to_move();
     PAWN_VALUE * (pos.count(c, PAWN) - pos.count(!c, PAWN)) + pos.non_pawn_material(c)
         - pos.non_pawn_material(!c)
@@ -36,16 +40,14 @@ pub fn evaluate(
     pos: &Position,
     accumulators: &mut AccumulatorStack,
     caches: &mut AccumulatorCaches,
-    optimism: i32,
 ) -> Value {
     debug_assert!(pos.checkers().is_empty());
     let nnue = network.evaluate(pos, accumulators, caches);
-    scale_evaluation(nnue, optimism, pos)
+    scale_evaluation(nnue, pos)
 }
 
-/// Applies search-dependent scaling (optimism and rule50) to the raw NNUE
-/// eval
-fn scale_evaluation(nnue: Value, optimism: i32, pos: &Position) -> Value {
+/// Applies material and rule50 scaling to the raw NNUE eval
+pub(crate) fn scale_evaluation<V: Variant>(nnue: Value, pos: &Position<V>) -> Value {
     let se = simple_eval(pos);
 
     // Normalize the raw evaluations to [-1024, 1024] to measure their
@@ -59,14 +61,17 @@ fn scale_evaluation(nnue: Value, optimism: i32, pos: &Position) -> Value {
     let correl = (se_norm * nnue_norm) / 512;
 
     // When winning, we boost easy positions, and vice versa
-    let mut v = nnue + (nnue + optimism) * correl / 65536;
+    let mut v = nnue + nnue * correl / 65536;
 
     // Scale the combined evaluation by total material
     let material = 521 * pos.count_both(PAWN) + pos.non_pawn_material_total();
     v += (i64::from(material) * i64::from(v) / 90649) as i32;
 
-    // Damp down the evaluation linearly when shuffling
-    v -= v * pos.rule50_count() / 189;
+    // Damp down the evaluation linearly when shuffling (Crazyhouse has no
+    // 50-move draw rule).
+    if !V::CRAZYHOUSE {
+        v -= v * pos.rule50_count() / 189;
+    }
 
     // Guarantee that the evaluation does not hit the tablebase range
     v.clamp(VALUE_TB_LOSS_IN_MAX_PLY + 1, VALUE_TB_WIN_IN_MAX_PLY - 1)
@@ -90,7 +95,7 @@ pub fn trace(pos: &Position, network: &Network) -> String {
     ss.push('\n');
 
     let nnue = network.evaluate(pos, &mut accumulators, &mut caches);
-    let s_v = scale_evaluation(nnue, VALUE_ZERO, pos); // requires stm perspective
+    let s_v = scale_evaluation(nnue, pos); // requires stm perspective
 
     let _ = writeln!(
         ss,

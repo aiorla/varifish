@@ -107,7 +107,7 @@ NET_URLS := https://tests.stockfishchess.org/api/nn/$(NET) \
 	https://github.com/official-stockfish/networks/raw/master/$(NET) \
 	https://media.githubusercontent.com/media/official-stockfish/networks/master/$(NET)
 
-.PHONY: build bolt evalspeed tablebases net atomic-net clean help
+.PHONY: build bolt evalspeed tablebases net atomic-net 3check-net crazyhouse-net antichess-net clean help
 
 # The WebAssembly builds embed no network, so they download none.
 ifneq ($(TARGET),wasm32-wasip1-threads)
@@ -118,10 +118,11 @@ build:
 	cp $(RELEASE_DIR)/$(EXE) $(EXE)
 
 # `make bolt` builds a Linux binary as `make build` does, then has BOLT lay
-# its code out by a profile of both variants' benches: chess's bench, and
-# Atomic's bench 16 1 17 on Atomic's network, which `make atomic-net`
-# downloads into nets/. It needs llvm-bolt and merge-fdata, named as LLVM
-# 20's bolt package names them. RUN_PREFIX runs the profiled binary under
+# its code out by a profile of the variants' benches: chess's bench, Atomic's
+# bench 16 1 17, and Three-check's, Crazyhouse's and Antichess's benches,
+# each on its network, which `make atomic-net`, `make 3check-net`, `make
+# crazyhouse-net` and `make antichess-net` download into nets/. It needs
+# llvm-bolt and merge-fdata, named as LLVM 20's bolt package names them. RUN_PREFIX runs the profiled binary under
 # another program, as Intel's SDE runs one whose instructions the machine
 # lacks, as in Stockfish's profile-build.
 LLVM_BOLT ?= llvm-bolt-20
@@ -133,7 +134,7 @@ BOLT_FLAGS = -reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions 
 # BOLT reads the linker's relocations, which a build of its own keeps.
 bolt: TARGET_DIR = target/$(ARCH)-relocs
 bolt: RUSTFLAGS_ARCH += -C link-arg=-Wl,--emit-relocs
-bolt: net atomic-net
+bolt: net atomic-net 3check-net crazyhouse-net antichess-net
 	$(CARGO_BUILD)
 	rm -rf $(BOLT_DIR)
 	mkdir -p $(BOLT_DIR)
@@ -143,6 +144,12 @@ bolt: net atomic-net
 	printf 'bench\nquit\n' | $(RUN_PREFIX) $(BOLT_DIR)/instrumented > $(BOLT_DIR)/chess.txt 2>&1
 	printf 'setoption name UCI_Variant value atomic\nsetoption name EvalFile value %s\nbench 16 1 17\nquit\n' \
 		nets/$(ATOMIC_NET) | $(RUN_PREFIX) $(BOLT_DIR)/instrumented > $(BOLT_DIR)/atomic.txt 2>&1
+	printf 'setoption name UCI_Variant value 3check\nsetoption name EvalFile value %s\nbench\nquit\n' \
+		nets/$(THREE_CHECK_NET) | $(RUN_PREFIX) $(BOLT_DIR)/instrumented > $(BOLT_DIR)/3check.txt 2>&1
+	printf 'setoption name UCI_Variant value crazyhouse\nsetoption name EvalFile value %s\nbench\nquit\n' \
+		nets/$(CRAZYHOUSE_NET) | $(RUN_PREFIX) $(BOLT_DIR)/instrumented > $(BOLT_DIR)/crazyhouse.txt 2>&1
+	printf 'setoption name UCI_Variant value antichess\nsetoption name EvalFile value %s\nbench\nquit\n' \
+		nets/$(ANTICHESS_NET) | $(RUN_PREFIX) $(BOLT_DIR)/instrumented > $(BOLT_DIR)/antichess.txt 2>&1
 	$(MERGE_FDATA) $(BOLT_DIR)/profile.fdata.*.fdata > $(BOLT_DIR)/merged.fdata 2> $(BOLT_DIR)/merge.log
 	$(LLVM_BOLT) $(RELEASE_DIR)/$(EXE) -o $(EXE) \
 		-data=$(BOLT_DIR)/merged.fdata $(BOLT_FLAGS) > $(BOLT_DIR)/optimize.log
@@ -157,22 +164,34 @@ tablebases:
 	$(CARGO_BUILD) --example tablebases
 	cp $(RELEASE_DIR)/examples/tablebases$(EXE_SUFFIX) tablebases$(EXE_SUFFIX)
 
-# Atomic's network, the one src/nnue/atomic.rs names, which
-# varifish's `networks` release has, checked against its SHA-256: Atomic's
-# builds embed none, and `make bolt` profiles Atomic's bench on it.
+# The variants' networks, those src/nnue/atomic.rs, threecheck.rs,
+# crazyhouse.rs and antichess.rs name, which varifish's `networks` release
+# has, each checked
+# against its whole SHA-256: the builds embed none, and `make bolt` profiles
+# each variant's bench on its own.
 ATOMIC_NET = atomic-b0d279b9e021.nnue
-ATOMIC_NET_SHA256 = b0d279b9e02158c73f0eca6f24603c11789e3e029e39715d351a54193920a638
-ATOMIC_NET_URL = https://github.com/aiorla/varifish/releases/download/networks/$(ATOMIC_NET)
+THREE_CHECK_NET = 3check-ae396b7e8123.nnue
+CRAZYHOUSE_NET = crazyhouse-b39a7a9b9831.nnue
+ANTICHESS_NET = antichess-64def68f336c.nnue
+$(ATOMIC_NET)_SHA256 = b0d279b9e02158c73f0eca6f24603c11789e3e029e39715d351a54193920a638
+$(THREE_CHECK_NET)_SHA256 = ae396b7e8123fd3923ecf781ef5b58b368303f404d41a7e5bc278d9941129dd1
+$(CRAZYHOUSE_NET)_SHA256 = b39a7a9b9831241fda4df559e151a754779adfa4801e78b873ef50656fb7f3ab
+$(ANTICHESS_NET)_SHA256 = 64def68f336c18a4bc63694a121c42dddf0a3d7b453fe694bbbac082e60ee2ab
+VARIANT_NETS = $(ATOMIC_NET) $(THREE_CHECK_NET) $(CRAZYHOUSE_NET) $(ANTICHESS_NET)
+NETWORKS_URL = https://github.com/aiorla/varifish/releases/download/networks
 
 atomic-net: nets/$(ATOMIC_NET)
+3check-net: nets/$(THREE_CHECK_NET)
+crazyhouse-net: nets/$(CRAZYHOUSE_NET)
+antichess-net: nets/$(ANTICHESS_NET)
 
-nets/$(ATOMIC_NET):
-	@echo "Downloading $(ATOMIC_NET_URL)"
-	@if curl -fsSL -o $@.part "$(ATOMIC_NET_URL)" && \
-		[ "$$( (sha256sum $@.part 2>/dev/null || shasum -a 256 $@.part) | cut -c1-64)" = "$(ATOMIC_NET_SHA256)" ]; then \
+$(addprefix nets/,$(VARIANT_NETS)): nets/%:
+	@echo "Downloading $(NETWORKS_URL)/$*"
+	@if curl -fsSL -o $@.part "$(NETWORKS_URL)/$*" && \
+		[ "$$( (sha256sum $@.part 2>/dev/null || shasum -a 256 $@.part) | cut -c1-64)" = "$($*_SHA256)" ]; then \
 		mv $@.part $@; \
 	else \
-		rm -f $@.part; echo "Failed to download $(ATOMIC_NET)" >&2; exit 1; \
+		rm -f $@.part; echo "Failed to download $*" >&2; exit 1; \
 	fi
 
 net: nets/$(NET)
@@ -198,8 +217,8 @@ help:
 	@echo "  x86-64-bmi2, x86-64-avx512, x86-64-vnni512, x86-64-avx512icl,"
 	@echo "  apple-silicon, armv8, armv8-dotprod, wasm32, wasm32-relaxed-simd"
 	@echo "make bolt ARCH=<arch>: on Linux, the build laid out by BOLT from a profile"
-	@echo "  of both variants' benches (needs LLVM's bolt; RUN_PREFIX runs the profile)"
-	@echo "make atomic-net: download Atomic's network into nets/"
+	@echo "  of the variants' benches (needs LLVM's bolt; RUN_PREFIX runs the profile)"
+	@echo "make atomic-net, 3check-net, crazyhouse-net or antichess-net: download that variant's network into nets/"
 	@echo "make evalspeed ARCH=<arch>: the example that times the evaluation"
 	@echo "make tablebases ARCH=<arch>: the example that prints the tablebases' probes"
 	@echo "TARGET=<Rust target> cross-compiles, as TARGET=aarch64-unknown-linux-gnu"
